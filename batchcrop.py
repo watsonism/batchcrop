@@ -23,7 +23,6 @@ class BatchCrop(tk.Tk):
         self.drag = None
         self.scale = 1.0
         self.offset = (0, 0)
-        self.delete_warning_enabled = tk.BooleanVar(value=True)
 
         self._build_ui()
         self.bind("<Configure>", lambda e: self.after_idle(self._fit_image))
@@ -41,6 +40,9 @@ class BatchCrop(tk.Tk):
         self.status.pack(side=tk.LEFT, padx=8)
         self.size_label = tk.Label(top, text="", bg="#2d2d2d", fg="#aaaaaa")
         self.size_label.pack(side=tk.RIGHT, padx=8)
+
+        self.path_label = tk.Label(self, text="", bg="#111111", fg="#ffffff", anchor="w", padx=8, pady=4)
+        self.path_label.pack(fill=tk.X)
 
         self.canvas = tk.Canvas(self, bg="#111111", cursor="cross")
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
@@ -71,24 +73,9 @@ class BatchCrop(tk.Tk):
             side=tk.LEFT, padx=4, pady=4
         )
 
-        self.warn_toggle = tk.Checkbutton(
-            bottom,
-            text="Delete warning",
-            variable=self.delete_warning_enabled,
-            bg="#2d2d2d",
-            fg="#cccccc",
-            selectcolor="#3a3a3a",
-            activebackground="#2d2d2d",
-            activeforeground="#cccccc",
-        )
-        self.warn_toggle.pack(side=tk.LEFT, padx=8)
-
-        self.path_label = tk.Label(bottom, text="", bg="#2d2d2d", fg="#cccccc")
-        self.path_label.pack(side=tk.LEFT, padx=8)
-
         help_lbl = tk.Label(
             bottom,
-            text="Left: prev   Right/Up: next   Down: prev   Enter: save crop   Del: delete   Esc: clear crop",
+            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop",
             bg="#2d2d2d",
             fg="#888888",
         )
@@ -149,14 +136,52 @@ class BatchCrop(tk.Tk):
         if not self.files or not self.image:
             return
         path = os.path.join(self.folder, self.files[self.index])
-        if self.delete_warning_enabled.get():
-            resp = messagebox.askyesno(
-                "Delete file",
-                f"Move this file to trash?\n\n{path}",
-                icon="warning",
-            )
-            if not resp:
-                return
+        warn_var = tk.BooleanVar(value=True)
+        dlg = tk.Toplevel(self)
+        dlg.title("Delete file")
+        dlg.configure(bg="#2d2d2d")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="Move this file to trash?", bg="#2d2d2d", fg="white").pack(
+            padx=12, pady=(12, 4)
+        )
+        path_box = tk.Text(dlg, width=80, height=3, bg="#111111", fg="white", wrap="word")
+        path_box.insert("1.0", path)
+        path_box.config(state="disabled")
+        path_box.pack(padx=12, pady=4)
+
+        chk = tk.Checkbutton(
+            dlg,
+            text="Warn before deleting",
+            variable=warn_var,
+            bg="#2d2d2d",
+            fg="#cccccc",
+            selectcolor="#3a3a3a",
+            activebackground="#2d2d2d",
+            activeforeground="#cccccc",
+        )
+        chk.pack(padx=12, pady=(4, 8), anchor="w")
+
+        btns = tk.Frame(dlg, bg="#2d2d2d")
+        btns.pack(pady=(0, 12))
+        tk.Button(btns, text="Cancel", width=10, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="Delete", width=10, bg="#a22", fg="white",
+                  command=lambda: self._confirm_delete(dlg, warn_var.get())).pack(side=tk.LEFT, padx=6)
+
+        self.wait_window(dlg)
+
+    def _confirm_delete(self, dlg, warn_enabled):
+        dlg.destroy()
+        if warn_enabled:
+            messagebox.showinfo("BatchCrop", "Delete warning is now ON for this session.")
+        self._do_delete()
+
+    def _do_delete(self):
+        if not self.files or not self.image:
+            return
+        path = os.path.join(self.folder, self.files[self.index])
         try:
             dest = os.path.join(self.folder, ".batchcrop_trash")
             os.makedirs(dest, exist_ok=True)
