@@ -23,6 +23,8 @@ class BatchCrop(tk.Tk):
         self.drag = None
         self.scale = 1.0
         self.offset = (0, 0)
+        self.delete_warning = True
+        self.deleting = False
 
         self._build_ui()
         self.bind("<Configure>", lambda e: self.after_idle(self._fit_image))
@@ -54,7 +56,7 @@ class BatchCrop(tk.Tk):
         self.bind("<Right>", lambda e: self.next())
         self.bind("<Up>", lambda e: self.next())
         self.bind("<Down>", lambda e: self.prev())
-        self.bind("<Return>", lambda e: self.save_crop())
+        self.bind("<Return>", lambda e: self._on_return())
         self.bind("<Delete>", lambda e: self.delete_current())
         self.bind("<Escape>", lambda e: self._clear_crop())
 
@@ -80,6 +82,11 @@ class BatchCrop(tk.Tk):
             fg="#888888",
         )
         help_lbl.pack(side=tk.RIGHT, padx=8)
+
+    def _on_return(self):
+        if self.deleting:
+            return
+        self.save_crop()
 
     # ------------------------------------------------------------------
     # Folder / navigation
@@ -133,10 +140,11 @@ class BatchCrop(tk.Tk):
     # Delete
     # ------------------------------------------------------------------
     def delete_current(self):
-        if not self.files or not self.image:
+        if not self.files or not self.image or self.deleting:
             return
         path = os.path.join(self.folder, self.files[self.index])
-        warn_var = tk.BooleanVar(value=True)
+
+        self.deleting = True
         dlg = tk.Toplevel(self)
         dlg.title("Delete file")
         dlg.configure(bg="#2d2d2d")
@@ -152,6 +160,7 @@ class BatchCrop(tk.Tk):
         path_box.config(state="disabled")
         path_box.pack(padx=12, pady=4)
 
+        warn_var = tk.BooleanVar(value=self.delete_warning)
         chk = tk.Checkbutton(
             dlg,
             text="Warn before deleting",
@@ -166,16 +175,24 @@ class BatchCrop(tk.Tk):
 
         btns = tk.Frame(dlg, bg="#2d2d2d")
         btns.pack(pady=(0, 12))
-        tk.Button(btns, text="Cancel", width=10, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
-        tk.Button(btns, text="Delete", width=10, bg="#a22", fg="white",
-                  command=lambda: self._confirm_delete(dlg, warn_var.get())).pack(side=tk.LEFT, padx=6)
+        cancel_btn = tk.Button(btns, text="Cancel", width=10, command=dlg.destroy)
+        cancel_btn.pack(side=tk.LEFT, padx=6)
+        delete_btn = tk.Button(
+            btns, text="Delete", width=10, bg="#a22", fg="white",
+            command=lambda: self._confirm_delete(dlg, warn_var.get())
+        )
+        delete_btn.pack(side=tk.LEFT, padx=6)
+
+        dlg.bind("<Return>", lambda e: self._confirm_delete(dlg, warn_var.get()))
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        delete_btn.focus_set()
 
         self.wait_window(dlg)
+        self.deleting = False
 
     def _confirm_delete(self, dlg, warn_enabled):
+        self.delete_warning = bool(warn_enabled)
         dlg.destroy()
-        if warn_enabled:
-            messagebox.showinfo("BatchCrop", "Delete warning is now ON for this session.")
         self._do_delete()
 
     def _do_delete(self):
