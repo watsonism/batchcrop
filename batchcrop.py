@@ -1,9 +1,13 @@
 import os
+import platform
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ImageOps
 
 SUPPORTED = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"}
+
+TOAST_MS = 1800
 
 
 class BatchCrop(tk.Tk):
@@ -25,6 +29,7 @@ class BatchCrop(tk.Tk):
         self.offset = (0, 0)
         self.delete_warning = True
         self.deleting = False
+        self.toast_job = None
 
         self._build_ui()
         self.bind("<Configure>", lambda e: self.after_idle(self._fit_image))
@@ -51,6 +56,7 @@ class BatchCrop(tk.Tk):
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Button-3>", self._on_right_click)
 
         self.bind("<Left>", lambda e: self.prev())
         self.bind("<Right>", lambda e: self.next())
@@ -59,10 +65,20 @@ class BatchCrop(tk.Tk):
         self.bind("<Return>", lambda e: self._on_return())
         self.bind("<Delete>", lambda e: self.delete_current())
         self.bind("<Escape>", lambda e: self._clear_crop())
+        self.bind("<Control-x>", lambda e: self.cut_current())
+        self.bind("<Control-X>", lambda e: self.cut_current())
+        self.bind("<Control-c>", lambda e: self.copy_current())
+        self.bind("<Control-C>", lambda e: self.copy_current())
 
         bottom = tk.Frame(self, bg="#2d2d2d")
         bottom.pack(fill=tk.X)
         tk.Button(bottom, text="Prev", command=self.prev, bg="#3a3a3a", fg="white").pack(
+            side=tk.LEFT, padx=4, pady=4
+        )
+        tk.Button(bottom, text="Cut (Ctrl+X)", command=self.cut_current, bg="#a60", fg="white").pack(
+            side=tk.LEFT, padx=4, pady=4
+        )
+        tk.Button(bottom, text="Copy (Ctrl+C)", command=self.copy_current, bg="#3a3a3a", fg="white").pack(
             side=tk.LEFT, padx=4, pady=4
         )
         tk.Button(bottom, text="Delete", command=self.delete_current, bg="#a22", fg="white").pack(
@@ -77,7 +93,7 @@ class BatchCrop(tk.Tk):
 
         help_lbl = tk.Label(
             bottom,
-            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop",
+            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Ctrl+X: cut   Ctrl+C: copy",
             bg="#2d2d2d",
             fg="#888888",
         )
@@ -87,6 +103,87 @@ class BatchCrop(tk.Tk):
         if self.deleting:
             return
         self.save_crop()
+
+    # ------------------------------------------------------------------
+    # Toast
+    # ------------------------------------------------------------------
+    def _show_toast(self, text):
+        if self.toast_job is not None:
+            self.after_cancel(self.toast_job)
+            self.toast_job = None
+        self._clear_toast()
+        cw = self.canvas.winfo_width() or 800
+        ch = self.canvas.winfo_height() or 600
+        x = cw // 2
+        y = ch - 60
+        pad_x = 18
+        pad_y = 10
+        txt = self.canvas.create_text(x, y, text=text, fill="#ffffff", font=("TkDefaultFont", 13, "bold"), tags="toast_text")
+        bbox = self.canvas.bbox(txt)
+        self.canvas.create_rectangle(
+            bbox[0] - pad_x, bbox[1] - pad_y, bbox[2] + pad_x, bbox[3] + pad_y,
+            fill="#000000", outline="#444444", width=1, tags="toast_bg"
+        )
+        self.canvas.tag_lower("toast_bg", txt)
+        self.toast_job = self.after(TOAST_MS, self._clear_toast)
+
+    def _clear_toast(self):
+        self.canvas.delete("toast_bg")
+        self.canvas.delete("toast_text")
+        self.toast_job = None
+
+    # ------------------------------------------------------------------
+    # Cut / Copy / Reveal
+    # ------------------------------------------------------------------
+    def _current_path(self):
+        if not self.files or not self.image or not self.folder:
+            return None
+        return os.path.join(self.folder, self.files[self.index])
+
+    def cut_current(self):
+        path = self._current_path()
+        if not path:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self._show_toast("Cut: " + os.path.basename(path))
+        self._do_delete()
+
+    def copy_current(self):
+        path = self._current_path()
+        if not path:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self._show_toast("Copied: " + os.path.basename(path))
+
+    def _on_right_click(self, event):
+        path = self._current_path()
+        if not path:
+            return
+        self._reveal_in_file_browser(path)
+
+    def _reveal_in_file_browser(self, path):
+        system = platform.system()
+        try:
+            if system == "Windows":
+                subprocess.Popen(["explorer.exe", "/select,", path])
+            elif system == "Darwin":
+                subprocess.Popen(["open", "-R", path])
+            else:
+                directory = os.path.dirname(path)
+                opened = False
+                for candidate in ("nautilus", "dolphin", "thunar", "nemo", "pcmanfm"):
+                    try:
+                        subprocess.Popen([candidate, "--select", path])
+                        opened = True
+                        break
+                    except FileNotFoundError:
+                        continue
+                if not opened:
+                    subprocess.Popen(["xdg-open", directory])
+        except Exception as e:
+            messagebox.showerror("BatchCrop", f"Could not open file browser:\n{e}")
 
     # ------------------------------------------------------------------
     # Folder / navigation
