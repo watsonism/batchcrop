@@ -12,6 +12,7 @@ A minimal, keyboard-driven desktop app for manually cropping screenshots in bulk
 - `Left Arrow` — previous image
 - `Up/Down Arrow` — skip current image without cropping
 - `Esc` — clear current crop selection
+- `Undo` button / `Ctrl+Z` — undo the last crop-box edit on the current image, then (newest first) saved crops (original restored, with its timestamps), deletes (file restored from `.batchcrop_trash`) and renames; up to 50 steps, cleared when you open another folder. Cut/paste moves done in Explorer are not undoable here
 - `Keep crop` checkbox / `K` — after saving a crop, the same crop box (same size and position) appears on the next image so you can just drag it up or down; if an image is too small it is shrunk to fit with the same ratio. `Esc` forgets it
 - Drag a crop box's edges or corners (white handles) to resize it; Shift while resizing keeps its ratio. Drag inside the box to move it
 - `Shift` + drag — lock a new crop to 1:1, or to the ratio of the crop you already had (draw outside the existing box; dragging inside it moves it)

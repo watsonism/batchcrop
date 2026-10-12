@@ -1,6 +1,9 @@
+import atexit
 import os
 import platform
 import re
+import shutil
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import tkinter as tk
@@ -10,6 +13,7 @@ from PIL import Image, ImageTk, ImageOps
 SUPPORTED = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"}
 
 TOAST_MS = 1800
+UNDO_LIMIT = 50
 
 SORT_MODES = ["Name A-Z", "Name Z-A", "Date old-new", "Date new-old"]
 THUMB = 150
@@ -48,6 +52,12 @@ class BatchCrop(tk.Tk):
         self.pan = (0, 0)
         self.pan_drag = None
         self.sort_var = tk.StringVar(value=SORT_MODES[0])
+        self.undo_stack = []      # file operations: crop save, delete, rename
+        self.crop_hist = []       # crop-box edits on the current image
+        self.undo_dir = None      # lazily created temp dir holding pre-crop backups
+        self.undo_counter = 0
+        atexit.register(self._cleanup_undo)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.gallery_on = False
         self.keep_crop_var = tk.BooleanVar(value=False)
         self.last_crop = None
@@ -129,6 +139,8 @@ class BatchCrop(tk.Tk):
         for k in ("<Control-minus>", "<Control-KP_Subtract>"):
             self.bind(k, lambda e: self.zoom_by(1 / 1.25))
         self.bind("<Control-0>", lambda e: self.zoom_reset())
+        self.bind("<Control-z>", lambda e: self.undo())
+        self.bind("<Control-Z>", lambda e: self.undo())
         self.bind("<F2>", lambda e: self.rename_current())
         self.bind("<Control-x>", lambda e: self.cut_current())
         self.bind("<Control-X>", lambda e: self.cut_current())
@@ -138,6 +150,9 @@ class BatchCrop(tk.Tk):
         bottom = tk.Frame(self, bg="#2d2d2d")
         bottom.pack(fill=tk.X)
         self.bottom = bottom
+        self.undo_btn = tk.Button(bottom, text="Undo (Ctrl+Z)", command=self.undo, bg="#3a3a3a", fg="white",
+                                  disabledforeground="#777777", state=tk.DISABLED)
+        self.undo_btn.pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(bottom, text="Prev", command=self.prev, bg="#3a3a3a", fg="white").pack(
             side=tk.LEFT, padx=4, pady=4
         )
@@ -165,7 +180,7 @@ class BatchCrop(tk.Tk):
 
         help_lbl = tk.Label(
             bottom,
-            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Drag edges/corners: resize   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   Ctrl+X: cut   Ctrl+C: copy",
+            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Drag edges/corners: resize   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   Ctrl+Z: undo   Ctrl+X: cut   Ctrl+C: copy",
             bg="#2d2d2d",
             fg="#888888",
         )
@@ -369,12 +384,135 @@ class BatchCrop(tk.Tk):
             return
         if self.pending_cut == path:
             self.pending_cut = None
+        self._push_undo({"kind": "rename", "old": path, "new": target})
         self.files[self.index] = new
         self._sort_files(keep=new)
         self.path_label.config(text=os.path.normpath(target))
         self.status.config(text=f"{self.index+1}/{len(self.files)}")
         self._gal_redraw()
         self._show_toast("Renamed: " + new)
+
+    # ------------------------------------------------------------------
+    # Undo
+    # ------------------------------------------------------------------
+    def _update_undo_btn(self):
+        can = bool(self.crop_hist or self.undo_stack)
+        self.undo_btn.config(state=tk.NORMAL if can else tk.DISABLED)
+
+    def _push_crop_hist(self):
+        self.crop_hist.append(tuple(self.crop) if self.crop else None)
+        del self.crop_hist[:-UNDO_LIMIT]
+        self._update_undo_btn()
+
+    def _push_undo(self, entry):
+        self.undo_stack.append(entry)
+        while len(self.undo_stack) > UNDO_LIMIT:
+            self._discard_entry(self.undo_stack.pop(0))
+        self._update_undo_btn()
+
+    def _make_backup(self, path):
+        """Copy the file (with its timestamps) to a temp dir before it is overwritten."""
+        try:
+            if self.undo_dir is None:
+                self.undo_dir = tempfile.mkdtemp(prefix="batchcrop_undo_")
+            self.undo_counter += 1
+            backup = os.path.join(self.undo_dir, f"{self.undo_counter}_{os.path.basename(path)}")
+            shutil.copy2(path, backup)
+            return backup
+        except Exception:
+            return None
+
+    def _discard_entry(self, entry):
+        b = entry.get("backup")
+        if b:
+            try:
+                os.remove(b)
+            except OSError:
+                pass
+
+    def _clear_undo(self):
+        for e in self.undo_stack:
+            self._discard_entry(e)
+        self.undo_stack = []
+        self.crop_hist = []
+        self._update_undo_btn()
+
+    def _cleanup_undo(self):
+        if self.undo_dir:
+            shutil.rmtree(self.undo_dir, ignore_errors=True)
+            self.undo_dir = None
+
+    def _on_close(self):
+        self._cleanup_undo()
+        self.destroy()
+
+    def _select_file(self, name):
+        """Make `name` (a file in self.folder) the current image, adding it to the list if needed."""
+        if name not in self.files:
+            self.files.append(name)
+        self._sort_files(keep=name)
+        self.load_image()
+
+    def undo(self):
+        # 1) crop-box edits on the current image come first
+        if self.crop_hist and self.image:
+            self.crop = self.crop_hist.pop()
+            self.drag = None
+            if self.crop:
+                self._clamp_crop()
+            self.canvas.delete("crop")
+            self._draw_crop()
+            self._update_crop_size_label()
+            self._update_undo_btn()
+            self._show_toast("Undid crop box change")
+            return
+        # 2) then file operations, newest first
+        if not self.undo_stack:
+            self._show_toast("Nothing to undo")
+            return
+        entry = self.undo_stack[-1]
+        kind = entry["kind"]
+        try:
+            if kind == "crop":
+                path = entry["path"]
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"{os.path.basename(path)} is no longer in its folder")
+                shutil.copy2(entry["backup"], path)
+                name = os.path.basename(path)
+                self._select_file(name)
+                self.crop = self._fit_crop_to_image(entry["rect"])
+                self.crop_hist = []
+                self._draw_crop()
+                self._update_crop_size_label()
+                msg = "Undid crop: " + name
+            elif kind == "delete":
+                path, trash = entry["path"], entry["trash"]
+                if not os.path.exists(trash):
+                    raise FileNotFoundError("The deleted file is no longer in .batchcrop_trash")
+                if os.path.exists(path):
+                    raise FileExistsError(f"{os.path.basename(path)} already exists in the folder")
+                os.rename(trash, path)
+                name = os.path.basename(path)
+                self._select_file(name)
+                msg = "Restored: " + name
+            else:  # rename
+                old, new = entry["old"], entry["new"]
+                if not os.path.exists(new):
+                    raise FileNotFoundError(f"{os.path.basename(new)} no longer exists")
+                if os.path.exists(old) and os.path.normcase(old) != os.path.normcase(new):
+                    raise FileExistsError(f"{os.path.basename(old)} already exists")
+                os.rename(new, old)
+                if os.path.basename(new) in self.files:
+                    self.files.remove(os.path.basename(new))
+                self._select_file(os.path.basename(old))
+                msg = "Undid rename: " + os.path.basename(old)
+        except Exception as e:
+            messagebox.showerror("BatchCrop", f"Undo failed:\n{e}")
+            return
+        self.undo_stack.pop()
+        self._discard_entry(entry)
+        self._update_undo_btn()
+        self._show_toast(msg)
 
     # ------------------------------------------------------------------
     # Sorting
@@ -613,6 +751,7 @@ class BatchCrop(tk.Tk):
         folder = filedialog.askdirectory()
         if not folder:
             return
+        self._clear_undo()
         self.folder = os.path.normpath(folder)  # askdirectory returns forward slashes on Windows
         self.files = [
             f for f in os.listdir(folder)
@@ -629,6 +768,7 @@ class BatchCrop(tk.Tk):
     def load_image(self):
         self.canvas.delete("all")
         self.crop = None
+        self.crop_hist = []
         self.zoom = 1.0
         self.pan = (0, 0)
         path = os.path.join(self.folder, self.files[self.index])
@@ -645,6 +785,8 @@ class BatchCrop(tk.Tk):
         self._gal_redraw()
 
     def _clear_crop(self):
+        if self.crop:
+            self._push_crop_hist()
         self.crop = None
         self.last_crop = None
         self.canvas.delete("crop")
@@ -738,6 +880,7 @@ class BatchCrop(tk.Tk):
         except Exception as e:
             messagebox.showerror("BatchCrop", f"Delete failed:\n{e}")
             return
+        self._push_undo({"kind": "delete", "path": path, "trash": target})
         del self.files[self.index]
         if not self.files:
             self.image = None
@@ -909,6 +1052,7 @@ class BatchCrop(tk.Tk):
             return
         ix, iy = self._canvas_to_image(event.x, event.y)
         prev_ratio = 1.0
+        self._push_crop_hist()
         if self.crop:
             handle = self._hit_handle(event.x, event.y)
             if handle:
@@ -1069,6 +1213,10 @@ class BatchCrop(tk.Tk):
         self.crop = (l, u, r, d)
 
     def _on_release(self, event):
+        # a click that changed nothing should not leave a no-op undo step
+        if self.drag and self.crop_hist and self.crop_hist[-1] == (tuple(self.crop) if self.crop else None):
+            self.crop_hist.pop()
+            self._update_undo_btn()
         self.drag = None
 
     def _update_crop_size_label(self):
@@ -1099,6 +1247,7 @@ class BatchCrop(tk.Tk):
         cropped = self.image.crop((x1, y1, x2, y2))
         path = os.path.join(self.folder, self.files[self.index])
         ext = os.path.splitext(path)[1].lower()
+        backup = self._make_backup(path)
         if ext in (".jpg", ".jpeg"):
             save = cropped.convert("RGB")
             save.save(path, quality=95, subsampling=0)
@@ -1115,6 +1264,8 @@ class BatchCrop(tk.Tk):
         else:
             target = ImageOps.exif_transpose(cropped)
             target.save(path)
+        if backup:
+            self._push_undo({"kind": "crop", "path": path, "backup": backup, "rect": (x1, y1, x2, y2)})
         self.last_crop = (x1, y1, x2, y2)
         self.crop = None
         self.canvas.delete("crop")
