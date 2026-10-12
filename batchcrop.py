@@ -69,6 +69,8 @@ class BatchCrop(tk.Tk):
 
         tk.Button(top, text="Open Folder", command=self.open_folder,
                   bg="#3a3a3a", fg="white", padx=8).pack(side=tk.LEFT, padx=4, pady=4)
+        tk.Button(top, text="Open in File Explorer", command=self.open_in_explorer,
+                  bg="#3a3a3a", fg="white", padx=8).pack(side=tk.LEFT, padx=4, pady=4)
         self.sort_menu = tk.OptionMenu(top, self.sort_var, *SORT_MODES, command=lambda _v: self.apply_sort())
         self.sort_menu.config(bg="#3a3a3a", fg="white", activebackground="#4a4a4a", activeforeground="white",
                               highlightthickness=0)
@@ -558,11 +560,35 @@ class BatchCrop(tk.Tk):
             return
         self._reveal_in_file_browser(path)
 
+    def open_in_explorer(self):
+        """Toolbar button: reveal the current file, or open the folder if no file is shown."""
+        if not self.folder:
+            self._show_toast("Open a folder first")
+            return
+        path = self._current_path() if self.files and self.image else None
+        if path and os.path.exists(path):
+            self._reveal_in_file_browser(path)
+        else:
+            self._open_directory(self.folder)
+
+    def _open_directory(self, directory):
+        system = platform.system()
+        try:
+            if system == "Windows":
+                subprocess.Popen(["explorer.exe", os.path.normpath(directory)])
+            elif system == "Darwin":
+                subprocess.Popen(["open", directory])
+            else:
+                subprocess.Popen(["xdg-open", directory])
+        except Exception as e:
+            messagebox.showerror("BatchCrop", f"Could not open file browser:\n{e}")
+
     def _reveal_in_file_browser(self, path):
         system = platform.system()
         try:
             if system == "Windows":
-                subprocess.Popen(["explorer.exe", "/select,", path])
+                # explorer /select needs backslashes (askdirectory returns forward slashes)
+                subprocess.Popen(["explorer.exe", "/select,", os.path.normpath(path)])
             elif system == "Darwin":
                 subprocess.Popen(["open", "-R", path])
             else:

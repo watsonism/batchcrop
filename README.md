@@ -5,6 +5,7 @@ A minimal, keyboard-driven desktop app for manually cropping screenshots in bulk
 ## Controls
 
 - `Open Folder` — pick a directory of images
+- `Open in File Explorer` (top bar) — reveal the current file in Explorer (opens the folder if no image is shown); right-click on the image does the same
 - Draw a crop rectangle with the mouse
 - `Enter` / `Save Crop` — apply crop, overwrite original, advance to next (with no crop drawn, it just advances without touching the file)
 - `Right Arrow` — next image
