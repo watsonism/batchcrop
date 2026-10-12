@@ -1059,7 +1059,8 @@ class BatchCrop(tk.Tk):
         if not self.image:
             return
         if not self.crop:
-            messagebox.showinfo("BatchCrop", "Draw a crop region first, then press Enter or Save Crop.")
+            # nothing to save: Enter/Save Crop just skips to the next image
+            self.next()
             return
         x1, y1, x2, y2 = self.crop
         # round position and size separately so a moved crop keeps its exact size
