@@ -92,6 +92,7 @@ class BatchCrop(tk.Tk):
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-3>", self._on_right_click)
 
         self.gallery_frame = tk.Frame(self, bg="#111111")
@@ -162,7 +163,7 @@ class BatchCrop(tk.Tk):
 
         help_lbl = tk.Label(
             bottom,
-            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   Ctrl+X: cut   Ctrl+C: copy",
+            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Drag edges/corners: resize   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   Ctrl+X: cut   Ctrl+C: copy",
             bg="#2d2d2d",
             fg="#888888",
         )
@@ -834,6 +835,10 @@ class BatchCrop(tk.Tk):
         d = d * self.scale + self.offset[1]
         self.canvas.create_rectangle(l, u, r, d, outline="#00ff88", width=2, tags="crop")
         self.canvas.create_rectangle(l, u, r, d, fill="#00ff88", stipple="gray50", tags="crop")
+        mx, my = (l + r) / 2, (u + d) / 2
+        for hx, hy in ((l, u), (mx, u), (r, u), (r, my), (r, d), (mx, d), (l, d), (l, my)):
+            self.canvas.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4, fill="#ffffff", outline="#00ff88",
+                                         tags="crop")
 
     def _canvas_to_image(self, x, y):
         return (x - self.offset[0]) / self.scale, (y - self.offset[1]) / self.scale
@@ -879,6 +884,10 @@ class BatchCrop(tk.Tk):
         ix, iy = self._canvas_to_image(event.x, event.y)
         prev_ratio = 1.0
         if self.crop:
+            handle = self._hit_handle(event.x, event.y)
+            if handle:
+                self.drag = ("resize", handle, tuple(self.crop))
+                return
             l, u, r, d = self.crop
             if l - 8 <= ix <= r + 8 and u - 8 <= iy <= d + 8:
                 self.drag = ("move", ix - l, iy - u)
@@ -918,6 +927,8 @@ class BatchCrop(tk.Tk):
             r = max(ax, ix)
             d = max(ay, iy)
             self.crop = (l, u, r, d)
+        elif self.drag[0] == "resize":
+            self._resize_crop(ix, iy, bool(event.state & 0x1))
         else:
             _, ox, oy = self.drag
             w = self.crop[2] - self.crop[0]
@@ -928,6 +939,108 @@ class BatchCrop(tk.Tk):
         self._clamp_crop()
         self._draw_crop()
         self._update_crop_size_label()
+
+    HANDLE_CURSORS = {
+        "nw": "top_left_corner", "ne": "top_right_corner",
+        "sw": "bottom_left_corner", "se": "bottom_right_corner",
+        "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+        "e": "sb_h_double_arrow", "w": "sb_h_double_arrow",
+    }
+
+    def _hit_handle(self, cx, cy):
+        """Return 'n','ne','e',... if the canvas point is on a crop edge/corner."""
+        if not self.crop:
+            return None
+        l, u, r, d = self.crop
+        l = l * self.scale + self.offset[0]
+        u = u * self.scale + self.offset[1]
+        r = r * self.scale + self.offset[0]
+        d = d * self.scale + self.offset[1]
+        # tolerance shrinks for small boxes so the interior stays grabbable
+        tol = max(3, min(9, (r - l) / 3, (d - u) / 3))
+        if not (l - tol <= cx <= r + tol and u - tol <= cy <= d + tol):
+            return None
+        near_l, near_r = abs(cx - l) <= tol, abs(cx - r) <= tol
+        near_u, near_d = abs(cy - u) <= tol, abs(cy - d) <= tol
+        v = "n" if near_u else "s" if near_d else ""
+        h = "w" if near_l else "e" if near_r else ""
+        return (v + h) or None
+
+    def _on_motion(self, event):
+        if self.drag or not self.image:
+            return
+        handle = self._hit_handle(event.x, event.y)
+        if handle:
+            cur = self.HANDLE_CURSORS[handle]
+        elif self.crop:
+            ix, iy = self._canvas_to_image(event.x, event.y)
+            l, u, r, d = self.crop
+            cur = "fleur" if (l <= ix <= r and u <= iy <= d) else "cross"
+        else:
+            cur = "cross"
+        if str(self.canvas.cget("cursor")) != cur:
+            self.canvas.config(cursor=cur)
+
+    def _resize_crop(self, ix, iy, shift):
+        MIN = 2
+        handle, (l0, u0, r0, d0) = self.drag[1], self.drag[2]
+        iw, ih = self.image.width, self.image.height
+        l, u, r, d = l0, u0, r0, d0
+        if "w" in handle:
+            l = max(0, min(ix, r0 - MIN))
+        if "e" in handle:
+            r = min(iw, max(ix, l0 + MIN))
+        if "n" in handle:
+            u = max(0, min(iy, d0 - MIN))
+        if "s" in handle:
+            d = min(ih, max(iy, u0 + MIN))
+        if shift and (d0 - u0) > 0:
+            ratio = (r0 - l0) / (d0 - u0)
+            if len(handle) == 2:
+                # corner: keep the opposite corner fixed
+                fx = r0 if "w" in handle else l0
+                fy = d0 if "n" in handle else u0
+                sx = -1 if "w" in handle else 1
+                sy = -1 if "n" in handle else 1
+                w = max(MIN, abs(ix - fx))
+                h = max(MIN, abs(iy - fy))
+                if h * ratio < w:
+                    h = w / ratio
+                else:
+                    w = h * ratio
+                room_w = fx if sx < 0 else iw - fx
+                room_h = fy if sy < 0 else ih - fy
+                k = min(1.0, room_w / w, room_h / h)
+                w, h = w * k, h * k
+                l, r = (fx - w, fx) if sx < 0 else (fx, fx + w)
+                u, d = (fy - h, fy) if sy < 0 else (fy, fy + h)
+            elif handle in ("e", "w"):
+                w = r - l
+                h = w / ratio
+                if h > ih:
+                    h = ih
+                    w = h * ratio
+                    if handle == "e":
+                        r = l + w
+                    else:
+                        l = r - w
+                cy = (u0 + d0) / 2
+                u = max(0, min(cy - h / 2, ih - h))
+                d = u + h
+            else:
+                h = d - u
+                w = h * ratio
+                if w > iw:
+                    w = iw
+                    h = w / ratio
+                    if handle == "s":
+                        d = u + h
+                    else:
+                        u = d - h
+                cx = (l0 + r0) / 2
+                l = max(0, min(cx - w / 2, iw - w))
+                r = l + w
+        self.crop = (l, u, r, d)
 
     def _on_release(self, event):
         self.drag = None

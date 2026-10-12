@@ -12,6 +12,7 @@ A minimal, keyboard-driven desktop app for manually cropping screenshots in bulk
 - `Up/Down Arrow` — skip current image without cropping
 - `Esc` — clear current crop selection
 - `Keep crop` checkbox / `K` — after saving a crop, the same crop box (same size and position) appears on the next image so you can just drag it up or down; if an image is too small it is shrunk to fit with the same ratio. `Esc` forgets it
+- Drag a crop box's edges or corners (white handles) to resize it; Shift while resizing keeps its ratio. Drag inside the box to move it
 - `Shift` + drag — lock a new crop to 1:1, or to the ratio of the crop you already had (draw outside the existing box; dragging inside it moves it)
 - Sort dropdown (top bar) — Name A-Z, Name Z-A, Date old-new, Date new-old (date = modified time); the current image stays selected
 - `G` / `Gallery` button — scrollable thumbnail grid. Click selects, double-click or Enter opens the image, arrows move, wheel scrolls; Delete, Rename, Cut and Copy act on the selected image
