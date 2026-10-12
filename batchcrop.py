@@ -371,7 +371,7 @@ class BatchCrop(tk.Tk):
             self.pending_cut = None
         self.files[self.index] = new
         self._sort_files(keep=new)
-        self.path_label.config(text=target)
+        self.path_label.config(text=os.path.normpath(target))
         self.status.config(text=f"{self.index+1}/{len(self.files)}")
         self._gal_redraw()
         self._show_toast("Renamed: " + new)
@@ -613,7 +613,7 @@ class BatchCrop(tk.Tk):
         folder = filedialog.askdirectory()
         if not folder:
             return
-        self.folder = folder
+        self.folder = os.path.normpath(folder)  # askdirectory returns forward slashes on Windows
         self.files = [
             f for f in os.listdir(folder)
             if os.path.isfile(os.path.join(folder, f))
@@ -640,7 +640,7 @@ class BatchCrop(tk.Tk):
             self.crop = self._fit_crop_to_image(self.last_crop)
         self._fit_image()
         self.status.config(text=f"{self.index+1}/{len(self.files)}")
-        self.path_label.config(text=path)
+        self.path_label.config(text=os.path.normpath(path))
         self._update_crop_size_label()
         self._gal_redraw()
 
