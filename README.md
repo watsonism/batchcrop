@@ -17,7 +17,9 @@ A minimal, keyboard-driven desktop app for manually cropping screenshots in bulk
 - Drag a crop box's edges or corners (white handles) to resize it; Shift while resizing keeps its ratio. Drag inside the box to move it
 - `Shift` + drag — lock a new crop to 1:1, or to the ratio of the crop you already had (draw outside the existing box; dragging inside it moves it)
 - Sort dropdown (top bar) — Name A-Z, Name Z-A, Date old-new, Date new-old (date = modified time); the current image stays selected
-- `G` / `Gallery` button — scrollable thumbnail grid. Click selects, double-click or Enter opens the image, arrows move, wheel scrolls; Delete, Rename, Cut and Copy act on the selected image
+- `G` / `Gallery` button — scrollable thumbnail grid. Double-click or Enter opens an image, arrows move, wheel scrolls.
+  - **Multi-select** (Explorer-style): click selects one; `Ctrl`+click toggles; `Shift`+click selects a range; `Ctrl+Shift`+click adds a range; `Shift`+arrows extend from the anchor; `Ctrl+A` selects all; `Esc` or a click on empty space clears. Click and drag on the grid draws a selection box (`Ctrl`/`Shift` adds to the current selection; dragging past the top/bottom edge auto-scrolls). The top bar shows "N selected".
+  - With several images selected, `Delete` (one confirmation listing the files, all go to `.batchcrop_trash`), `Ctrl+X` and `Ctrl+C` (all files go on the Windows clipboard, paste them anywhere in Explorer) act on the whole selection, and a multi-delete is a single `Ctrl+Z` step. Rename and cropping stay one image at a time.
 - `Mouse wheel` — previous/next file
 - `Ctrl +` / `Ctrl -` / `Ctrl+wheel` — zoom in/out (Ctrl+0 resets); middle-drag pans when zoomed
 - `Rename` / `F2` — rename the current file (extension kept if omitted)

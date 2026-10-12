@@ -46,8 +46,17 @@ class BatchCrop(tk.Tk):
         self.delete_warning = True
         self.deleting = False
         self.toast_job = None
-        self.pending_cut = None
+        self.pending_cut = []
         self.cut_job = None
+        self.selection = set()     # selected file names (gallery view)
+        self.sel_anchor = None
+        self.rubber = None         # rubber-band rectangle in gallery canvas coords
+        self.rb_origin = None
+        self.rb_moved = False
+        self.rb_base = set()
+        self.rb_xy = (0, 0)
+        self.rb_job = None
+        self.toast_text = ""
         self.zoom = 1.0
         self.pan = (0, 0)
         self.pan_drag = None
@@ -114,7 +123,9 @@ class BatchCrop(tk.Tk):
                                  yscrollcommand=self.gallery_sb.set)
         self.gcanvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.gcanvas.bind("<Configure>", lambda e: self._gal_redraw())
-        self.gcanvas.bind("<Button-1>", self._gal_click)
+        self.gcanvas.bind("<ButtonPress-1>", self._gal_press)
+        self.gcanvas.bind("<B1-Motion>", self._gal_drag)
+        self.gcanvas.bind("<ButtonRelease-1>", self._gal_release)
         self.gcanvas.bind("<Double-Button-1>", self._gal_double)
         self.gcanvas.bind("<Button-3>", self._on_right_click)
 
@@ -128,7 +139,13 @@ class BatchCrop(tk.Tk):
         self.bind("<G>", lambda e: self.toggle_gallery())
         self.bind("<Return>", lambda e: self._on_return())
         self.bind("<Delete>", lambda e: self.delete_current())
-        self.bind("<Escape>", lambda e: self._clear_crop())
+        self.bind("<Escape>", lambda e: self._on_escape())
+        self.bind("<Control-a>", lambda e: self.select_all())
+        self.bind("<Control-A>", lambda e: self.select_all())
+        self.bind("<Shift-Left>", lambda e: self._shift_arrow(-1))
+        self.bind("<Shift-Right>", lambda e: self._shift_arrow(1))
+        self.bind("<Shift-Up>", lambda e: self._shift_arrow(-1, vertical=True))
+        self.bind("<Shift-Down>", lambda e: self._shift_arrow(1, vertical=True))
         self.bind("<MouseWheel>", self._on_wheel)
         self.bind("<Button-4>", self._on_wheel)
         self.bind("<Button-5>", self._on_wheel)
@@ -202,24 +219,36 @@ class BatchCrop(tk.Tk):
             self.after_cancel(self.toast_job)
             self.toast_job = None
         self._clear_toast()
-        cw = self.canvas.winfo_width() or 800
-        ch = self.canvas.winfo_height() or 600
+        self.toast_text = text
+        self._draw_toast()
+        self.toast_job = self.after(TOAST_MS, self._clear_toast)
+
+    def _draw_toast(self):
+        if not self.toast_text:
+            return
+        c = self.gcanvas if self.gallery_on else self.canvas
+        c.delete("toast_bg")
+        c.delete("toast_text")
+        cw = c.winfo_width() or 800
+        ch = c.winfo_height() or 600
         x = cw // 2
-        y = ch - 60
+        y = ch - 60 + (c.canvasy(0) if self.gallery_on else 0)
         pad_x = 18
         pad_y = 10
-        txt = self.canvas.create_text(x, y, text=text, fill="#ffffff", font=("TkDefaultFont", 13, "bold"), tags="toast_text")
-        bbox = self.canvas.bbox(txt)
-        self.canvas.create_rectangle(
+        txt = c.create_text(x, y, text=self.toast_text, fill="#ffffff", font=("TkDefaultFont", 13, "bold"),
+                            tags="toast_text")
+        bbox = c.bbox(txt)
+        c.create_rectangle(
             bbox[0] - pad_x, bbox[1] - pad_y, bbox[2] + pad_x, bbox[3] + pad_y,
             fill="#000000", outline="#444444", width=1, tags="toast_bg"
         )
-        self.canvas.tag_lower("toast_bg", txt)
-        self.toast_job = self.after(TOAST_MS, self._clear_toast)
+        c.tag_lower("toast_bg", txt)
 
     def _clear_toast(self):
-        self.canvas.delete("toast_bg")
-        self.canvas.delete("toast_text")
+        for c in (self.canvas, self.gcanvas):
+            c.delete("toast_bg")
+            c.delete("toast_text")
+        self.toast_text = ""
         self.toast_job = None
 
     # ------------------------------------------------------------------
@@ -230,8 +259,8 @@ class BatchCrop(tk.Tk):
             return None
         return os.path.join(self.folder, self.files[self.index])
 
-    def _set_file_clipboard(self, path, move):
-        """Put a file on the system clipboard (CF_HDROP + Preferred DropEffect).
+    def _set_file_clipboard(self, paths, move):
+        """Put file(s) on the system clipboard (CF_HDROP + Preferred DropEffect).
 
         On Windows this is the same thing Explorer's Ctrl+X / Ctrl+C does, so
         the file can be pasted in Explorer. Returns False if unsupported.
@@ -263,10 +292,12 @@ class BatchCrop(tk.Tk):
             k32.GlobalUnlock(h)
             return h
 
-        path = os.path.normpath(os.path.abspath(path))
+        if isinstance(paths, str):
+            paths = [paths]
+        paths = [os.path.normpath(os.path.abspath(p)) for p in paths]
         # DROPFILES header: pFiles=20, pt=(0,0), fNC=0, fWide=1
         header = (20).to_bytes(4, "little") + bytes(8) + bytes(4) + (1).to_bytes(4, "little")
-        hdrop = make_global(header + (path + "\0\0").encode("utf-16-le"))
+        hdrop = make_global(header + ("\0".join(paths) + "\0\0").encode("utf-16-le"))
         fmt = u32.RegisterClipboardFormatW("Preferred DropEffect")
         effect = make_global((2 if move else 1).to_bytes(4, "little"))
 
@@ -288,33 +319,52 @@ class BatchCrop(tk.Tk):
         finally:
             u32.CloseClipboard()
 
-    def _put_on_clipboard(self, path, move):
-        if not self._set_file_clipboard(path, move):
-            # Fallback (non-Windows / failure): plain text path
+    def _put_on_clipboard(self, paths, move):
+        if not self._set_file_clipboard(paths, move):
+            # Fallback (non-Windows / failure): plain text path(s)
             self.clipboard_clear()
-            self.clipboard_append(path)
+            self.clipboard_append("\n".join([paths] if isinstance(paths, str) else paths))
             return False
         return True
 
+    # ------------------------------------------------------------------
+    # Targets: the selection in gallery view, otherwise the current image
+    # ------------------------------------------------------------------
+    def _target_names(self):
+        if self.gallery_on and self.selection:
+            names = [f for f in self.files if f in self.selection]
+            if names:
+                return names
+        if self.files and self.image and 0 <= self.index < len(self.files):
+            return [self.files[self.index]]
+        return []
+
+    def _target_paths(self):
+        return [os.path.join(self.folder, n) for n in self._target_names()]
+
+    @staticmethod
+    def _describe(paths):
+        return os.path.basename(paths[0]) if len(paths) == 1 else f"{len(paths)} files"
+
     def cut_current(self):
-        """Ctrl+X: mark file as cut on the clipboard. File is NOT moved here.
-        Once it is pasted elsewhere (and disappears from this folder), the
-        watcher advances to the next image."""
-        path = self._current_path()
-        if not path:
+        """Ctrl+X: mark file(s) as cut on the clipboard. Nothing is moved here.
+        Once pasted elsewhere (and gone from this folder), the watcher drops
+        them from the list and moves on."""
+        paths = self._target_paths()
+        if not paths:
             return
-        real = self._put_on_clipboard(path, move=True)
-        self.pending_cut = path
-        self._show_toast(("Cut: " if real else "Cut (path only): ") + os.path.basename(path))
+        real = self._put_on_clipboard(paths, move=True)
+        self.pending_cut = list(paths)
+        self._show_toast(("Cut: " if real else "Cut (path only): ") + self._describe(paths))
         self._schedule_cut_watch()
 
     def copy_current(self):
-        path = self._current_path()
-        if not path:
+        paths = self._target_paths()
+        if not paths:
             return
-        real = self._put_on_clipboard(path, move=False)
-        self.pending_cut = None
-        self._show_toast(("Copied: " if real else "Copied (path only): ") + os.path.basename(path))
+        real = self._put_on_clipboard(paths, move=False)
+        self.pending_cut = []
+        self._show_toast(("Copied: " if real else "Copied (path only): ") + self._describe(paths))
 
     def _schedule_cut_watch(self):
         if self.cut_job is None:
@@ -322,40 +372,50 @@ class BatchCrop(tk.Tk):
 
     def _check_cut(self):
         self.cut_job = None
-        path = self.pending_cut
-        if not path:
+        if not self.pending_cut:
             return
-        if os.path.exists(path):
+        gone = [p for p in self.pending_cut if not os.path.exists(p)]
+        self.pending_cut = [p for p in self.pending_cut if p not in gone]
+        if self.pending_cut:
             self._schedule_cut_watch()
+        if not gone:
             return
-        # File was moved away (pasted elsewhere): drop it and go to next image
-        self.pending_cut = None
         folder_norm = os.path.normcase(os.path.normpath(self.folder or ""))
-        if os.path.normcase(os.path.normpath(os.path.dirname(path))) != folder_norm:
+        names = {os.path.basename(p) for p in gone
+                 if os.path.normcase(os.path.normpath(os.path.dirname(p))) == folder_norm}
+        names &= set(self.files)
+        if not names:
             return
-        name = os.path.basename(path)
-        if name not in self.files:
-            return
-        idx = self.files.index(name)
-        was_current = idx == self.index
-        del self.files[idx]
+        self._remove_from_list(names)
+
+    def _remove_from_list(self, names):
+        """Drop files from the list (they left the folder) and keep a sensible current image."""
+        old_index = self.index
+        cur = self.files[old_index] if 0 <= old_index < len(self.files) else None
+        removed_before = sum(1 for i, f in enumerate(self.files) if f in names and i < old_index)
+        self.files = [f for f in self.files if f not in names]
+        self.selection -= names
         if not self.files:
             self.image = None
+            self.selection = set()
             self.canvas.delete("all")
             self.status.config(text="0/0")
             self.path_label.config(text="")
             self.size_label.config(text="")
+            self._gal_redraw()
             return
-        if idx < self.index:
-            self.index -= 1
-        self.index %= len(self.files)
-        if was_current:
-            self.load_image()
-        else:
+        if cur in self.files:
+            self.index = self.files.index(cur)
             self.status.config(text=f"{self.index+1}/{len(self.files)}")
-        self._gal_redraw()
+            self._gal_redraw()
+        else:
+            self.index = min(old_index - removed_before, len(self.files) - 1)
+            self.load_image()
 
     def rename_current(self):
+        if self.gallery_on and len(self.selection) > 1:
+            self._show_toast("Rename works on one image: select a single image")
+            return
         path = self._current_path()
         if not path:
             return
@@ -382,10 +442,14 @@ class BatchCrop(tk.Tk):
         except Exception as e:
             messagebox.showerror("BatchCrop", f"Rename failed:\n{e}")
             return
-        if self.pending_cut == path:
-            self.pending_cut = None
+        if path in self.pending_cut:
+            self.pending_cut.remove(path)
+        self.selection.discard(os.path.basename(path))
         self._push_undo({"kind": "rename", "old": path, "new": target})
         self.files[self.index] = new
+        if self.gallery_on:
+            self.selection = {new}
+            self.sel_anchor = new
         self._sort_files(keep=new)
         self.path_label.config(text=os.path.normpath(target))
         self.status.config(text=f"{self.index+1}/{len(self.files)}")
@@ -451,6 +515,9 @@ class BatchCrop(tk.Tk):
         if name not in self.files:
             self.files.append(name)
         self._sort_files(keep=name)
+        if self.gallery_on:
+            self.selection = {name}
+            self.sel_anchor = name
         self.load_image()
 
     def undo(self):
@@ -485,6 +552,24 @@ class BatchCrop(tk.Tk):
                 self._draw_crop()
                 self._update_crop_size_label()
                 msg = "Undid crop: " + name
+            elif kind == "delete_many":
+                items = entry["items"]
+                for src, trash in items:
+                    if not os.path.exists(trash):
+                        raise FileNotFoundError(f"{os.path.basename(src)} is no longer in .batchcrop_trash")
+                    if os.path.exists(src):
+                        raise FileExistsError(f"{os.path.basename(src)} already exists in the folder")
+                for src, trash in items:
+                    os.rename(trash, src)
+                names = [os.path.basename(src) for src, _ in items]
+                for n in names:
+                    if n not in self.files:
+                        self.files.append(n)
+                self._select_file(names[0])
+                if self.gallery_on:
+                    self.selection = set(names)
+                    self._gal_redraw()
+                msg = "Restored: " + (names[0] if len(names) == 1 else f"{len(names)} files")
             elif kind == "delete":
                 path, trash = entry["path"], entry["trash"]
                 if not os.path.exists(trash):
@@ -513,6 +598,14 @@ class BatchCrop(tk.Tk):
         self._discard_entry(entry)
         self._update_undo_btn()
         self._show_toast(msg)
+
+    def _update_status(self):
+        if not self.files:
+            return
+        text = f"{self.index+1}/{len(self.files)}"
+        if self.gallery_on and len(self.selection) > 1:
+            text += f"   ({len(self.selection)} selected)"
+        self.status.config(text=text)
 
     # ------------------------------------------------------------------
     # Sorting
@@ -553,11 +646,16 @@ class BatchCrop(tk.Tk):
             self.gallery_frame.pack_forget()
             self.canvas.pack(fill=tk.BOTH, expand=True, padx=6, pady=6, before=self.bottom)
             self.gallery_btn.config(text="Gallery (G)", bg="#3a3a3a")
+            self.selection = set()     # multi-select only applies in gallery view
+            self.sel_anchor = None
+            self._update_status()
             self.after_idle(self._fit_image)
         else:
             if not self.files:
                 return
             self.gallery_on = True
+            self.selection = {self.files[self.index]}
+            self.sel_anchor = self.files[self.index]
             self.canvas.pack_forget()
             self.gallery_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6, before=self.bottom)
             self.gallery_btn.config(text="Single (G)", bg="#2a6")
@@ -590,6 +688,8 @@ class BatchCrop(tk.Tk):
         c.delete("all")
         if not self.files:
             return
+        self.selection &= set(self.files)
+        self._update_status()
         cols = self._gal_cols()
         rows = (len(self.files) + cols - 1) // cols
         w = c.winfo_width() or 800
@@ -606,15 +706,21 @@ class BatchCrop(tk.Tk):
                 if i >= len(self.files):
                     break
                 self._gal_draw_cell(i, col * G_CELL_W, r * G_CELL_H)
+        if self.rubber:
+            c.create_rectangle(*self.rubber, outline="#4aa3ff", fill="#4aa3ff", stipple="gray25", tags="rubber")
+        if self.toast_text:
+            self._draw_toast()
 
     def _gal_draw_cell(self, i, x, y):
         c = self.gcanvas
         name = self.files[i]
         path = os.path.join(self.folder, name)
-        selected = i == self.index
+        focus = i == self.index
+        selected = name in self.selection
         c.create_rectangle(x + 2, y + 2, x + G_CELL_W - 2, y + G_CELL_H - 2,
-                           fill="#2a3a30" if selected else "#1a1a1a",
-                           outline="#00ff88" if selected else "#2a2a2a", width=2 if selected else 1)
+                           fill="#1f3550" if selected else ("#2a3a30" if focus else "#1a1a1a"),
+                           outline="#00ff88" if focus else ("#4aa3ff" if selected else "#2a2a2a"),
+                           width=2 if (focus or selected) else 1)
         try:
             key = (path, os.path.getmtime(path))
         except OSError:
@@ -670,27 +776,151 @@ class BatchCrop(tk.Tk):
         i = row * cols + col
         return i if i < len(self.files) else None
 
-    def _gal_click(self, event):
+    def _gal_hits(self, rect):
+        """Names of thumbnails whose cell intersects rect (gallery canvas coordinates)."""
+        x1, y1, x2, y2 = rect
+        cols = self._gal_cols()
+        c1, c2 = max(0, int(x1 // G_CELL_W)), min(cols - 1, int(x2 // G_CELL_W))
+        r1, r2 = max(0, int(y1 // G_CELL_H)), int(y2 // G_CELL_H)
+        names = set()
+        for r in range(r1, r2 + 1):
+            for col in range(c1, c2 + 1):
+                i = r * cols + col
+                if 0 <= i < len(self.files):
+                    names.add(self.files[i])
+        return names
+
+    def _gal_range(self, a_name, b_name):
+        if a_name not in self.files or b_name not in self.files:
+            return {b_name}
+        i, j = sorted((self.files.index(a_name), self.files.index(b_name)))
+        return set(self.files[i:j + 1])
+
+    def _gal_press(self, event):
+        ctrl, shift = bool(event.state & 0x4), bool(event.state & 0x1)
+        self.rb_origin = (event.x, self.gcanvas.canvasy(event.y))
+        self.rb_moved = False
+        self.rb_base = set(self.selection) if (ctrl or shift) else set()
         i = self._gal_index_at(event)
-        if i is not None and i != self.index:
+        if i is None:
+            if not (ctrl or shift):
+                self.selection = set()     # click on empty space clears the selection
+                self.sel_anchor = None
+                self._gal_redraw()
+            return
+        name = self.files[i]
+        if ctrl and not shift:
+            self.selection = (self.selection - {name}) if name in self.selection else (self.selection | {name})
+            self.sel_anchor = name
+        elif shift:
+            anchor = self.sel_anchor if self.sel_anchor in self.files else self.files[self.index]
+            rng = self._gal_range(anchor, name)
+            self.selection = (self.selection | rng) if ctrl else rng
+        else:
+            self.selection = {name}
+            self.sel_anchor = name
+        # a band dragged from here extends this selection only when Ctrl/Shift is held
+        self.rb_base = set(self.selection) if (ctrl or shift) else set()
+        if i != self.index:
             self.index = i
-            self.load_image()
+            self.load_image()      # also redraws
+        else:
+            self._gal_redraw()
+
+    def _gal_update_band(self, x, wy):
+        x0, y0 = self.rb_origin
+        y1 = self.gcanvas.canvasy(wy)
+        self.rubber = (min(x0, x), min(y0, y1), max(x0, x), max(y0, y1))
+        self.selection = self.rb_base | self._gal_hits(self.rubber)
+        self._gal_redraw()
+
+    def _gal_drag(self, event):
+        if not self.rb_origin:
+            return
+        x0, y0 = self.rb_origin
+        if not self.rb_moved and abs(event.x - x0) < 5 and abs(self.gcanvas.canvasy(event.y) - y0) < 5:
+            return
+        self.rb_moved = True
+        self.rb_xy = (event.x, event.y)
+        self._gal_update_band(event.x, event.y)
+        if self.rb_job is None:
+            self.rb_job = self.after(60, self._gal_autoscroll)
+
+    def _gal_autoscroll(self):
+        self.rb_job = None
+        if not (self.rb_origin and self.rb_moved):
+            return
+        x, y = self.rb_xy
+        h = self.gcanvas.winfo_height() or 600
+        if y < 20 or y > h - 20:
+            self.gcanvas.yview_scroll(-1 if y < 20 else 1, "units")
+            self._gal_update_band(x, y)
+        self.rb_job = self.after(60, self._gal_autoscroll)
+
+    def _gal_release(self, event):
+        if self.rb_job is not None:
+            self.after_cancel(self.rb_job)
+            self.rb_job = None
+        moved = self.rb_moved
+        self.rb_origin, self.rb_moved, self.rubber = None, False, None
+        if moved:
+            self._gal_redraw()
 
     def _gal_double(self, event):
         i = self._gal_index_at(event)
         if i is not None:
+            self.selection = {self.files[i]}
             self.index = i
             self.load_image()
             self.toggle_gallery()
 
-    def _gal_move(self, rows):
+    def _gal_move(self, rows, extend=False):
         if not self.files:
             return
         new = self.index + rows * self._gal_cols()
         if 0 <= new < len(self.files):
-            self.index = new
-            self.load_image()
-            self._gal_redraw(ensure_visible=True)
+            self._gal_goto(new, extend)
+
+    def _gal_goto(self, new, extend=False):
+        """Move the focus to index `new`; with extend, grow the selection from the anchor (Shift+arrows)."""
+        new %= len(self.files)
+        if extend:
+            anchor = self.sel_anchor if self.sel_anchor in self.files else self.files[self.index]
+            self.sel_anchor = anchor
+            self.selection = self._gal_range(anchor, self.files[new])
+        else:
+            self.selection = {self.files[new]}
+            self.sel_anchor = self.files[new]
+        self.index = new
+        self.load_image()
+        self._gal_redraw(ensure_visible=True)
+
+    def _shift_arrow(self, delta, vertical=False):
+        if not self.gallery_on:       # same as the plain arrows in single view
+            if vertical:
+                (self.next if delta < 0 else self.prev)()      # Up = next, Down = prev
+            else:
+                (self.prev if delta < 0 else self.next)()
+            return
+        if not self.files:
+            return
+        step = delta * (self._gal_cols() if vertical else 1)
+        new = self.index + step
+        if 0 <= new < len(self.files):
+            self._gal_goto(new, extend=True)
+
+    def select_all(self):
+        if self.gallery_on and self.files:
+            self.selection = set(self.files)
+            self._gal_redraw()
+
+    def _on_escape(self):
+        if self.gallery_on:
+            self.selection = set()
+            self.sel_anchor = None
+            self._gal_redraw()
+        else:
+            self._clear_crop()
 
     def _on_right_click(self, event):
         path = self._current_path()
@@ -794,12 +1024,18 @@ class BatchCrop(tk.Tk):
     def prev(self):
         if not self.files:
             return
+        if self.gallery_on:
+            self._gal_goto(self.index - 1)
+            return
         self.index = (self.index - 1) % len(self.files)
         self.load_image()
         self._gal_redraw(ensure_visible=True)
 
     def next(self):
         if not self.files:
+            return
+        if self.gallery_on:
+            self._gal_goto(self.index + 1)
             return
         self.index = (self.index + 1) % len(self.files)
         self.load_image()
@@ -811,7 +1047,10 @@ class BatchCrop(tk.Tk):
     def delete_current(self):
         if not self.files or not self.image or self.deleting:
             return
-        path = os.path.join(self.folder, self.files[self.index])
+        names = self._target_names()
+        if not names:
+            return
+        self._delete_targets = names
 
         self.deleting = True
         dlg = tk.Toplevel(self)
@@ -821,11 +1060,15 @@ class BatchCrop(tk.Tk):
         dlg.transient(self)
         dlg.grab_set()
 
-        tk.Label(dlg, text="Move this file to trash?", bg="#2d2d2d", fg="white").pack(
-            padx=12, pady=(12, 4)
-        )
-        path_box = tk.Text(dlg, width=80, height=3, bg="#111111", fg="white", wrap="word")
-        path_box.insert("1.0", path)
+        if len(names) == 1:
+            question, body, box_h = "Move this file to trash?", os.path.join(self.folder, names[0]), 3
+        else:
+            shown = names[:12]
+            body = "\n".join(shown) + (f"\n... and {len(names) - 12} more" if len(names) > 12 else "")
+            question, box_h = f"Move these {len(names)} files to trash?", min(len(shown) + (1 if len(names) > 12 else 0), 10)
+        tk.Label(dlg, text=question, bg="#2d2d2d", fg="white").pack(padx=12, pady=(12, 4))
+        path_box = tk.Text(dlg, width=80, height=box_h, bg="#111111", fg="white", wrap="word")
+        path_box.insert("1.0", body)
         path_box.config(state="disabled")
         path_box.pack(padx=12, pady=4)
 
@@ -862,35 +1105,52 @@ class BatchCrop(tk.Tk):
     def _confirm_delete(self, dlg, warn_enabled):
         self.delete_warning = bool(warn_enabled)
         dlg.destroy()
-        self._do_delete()
+        self._do_delete_many(self._delete_targets)
 
     def _do_delete(self):
+        """Move the current image to the trash folder."""
         if not self.files or not self.image:
             return
-        path = os.path.join(self.folder, self.files[self.index])
+        self._do_delete_many([self.files[self.index]])
+
+    @staticmethod
+    def _unique_trash_target(dest, base):
+        target = os.path.join(dest, base)
+        root, ext = os.path.splitext(base)
+        n = 1
+        while os.path.exists(target):
+            target = os.path.join(dest, f"{root}_{n}{ext}")
+            n += 1
+        return target
+
+    def _do_delete_many(self, names):
+        dest = os.path.join(self.folder, ".batchcrop_trash")
+        done, failed = [], []
         try:
-            dest = os.path.join(self.folder, ".batchcrop_trash")
             os.makedirs(dest, exist_ok=True)
-            base = os.path.basename(path)
-            target = os.path.join(dest, base)
-            if os.path.exists(target):
-                root, ext = os.path.splitext(base)
-                target = os.path.join(dest, f"{root}_1{ext}")
-            os.rename(path, target)
         except Exception as e:
             messagebox.showerror("BatchCrop", f"Delete failed:\n{e}")
             return
-        self._push_undo({"kind": "delete", "path": path, "trash": target})
-        del self.files[self.index]
-        if not self.files:
-            self.image = None
-            self.canvas.delete("all")
-            self.status.config(text="0/0")
-            self.path_label.config(text="")
-            self.size_label.config(text="")
+        for n in names:
+            src = os.path.join(self.folder, n)
+            try:
+                target = self._unique_trash_target(dest, n)
+                os.rename(src, target)
+                done.append((src, target))
+            except Exception as e:
+                failed.append((n, e))
+        if failed:
+            messagebox.showerror("BatchCrop", f"Could not delete {len(failed)} file(s):\n{failed[0][0]}: {failed[0][1]}")
+        if not done:
             return
-        self.index %= len(self.files)
-        self.load_image()
+        self._push_undo({"kind": "delete_many", "items": done})
+        removed = {os.path.basename(src) for src, _ in done}
+        self.pending_cut = [p for p in self.pending_cut if os.path.basename(p) not in removed]
+        self.sel_anchor = None
+        self._remove_from_list(removed)
+        self.selection = set()
+        self._gal_redraw()
+        self._show_toast("Moved to trash: " + (next(iter(removed)) if len(removed) == 1 else f"{len(removed)} files"))
 
     # ------------------------------------------------------------------
     # Rendering / transforms
