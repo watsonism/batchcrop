@@ -1,4 +1,5 @@
 import atexit
+import datetime
 import os
 import platform
 import re
@@ -57,6 +58,7 @@ class BatchCrop(tk.Tk):
         self.rb_xy = (0, 0)
         self.rb_job = None
         self.toast_text = ""
+        self.last_dest = None      # last folder used by Move to / Copy to
         self.zoom = 1.0
         self.pan = (0, 0)
         self.pan_drag = None
@@ -104,6 +106,15 @@ class BatchCrop(tk.Tk):
         self.size_label.pack(side=tk.RIGHT, padx=8)
         self.zoom_label = tk.Label(top, text="", bg="#2d2d2d", fg="#00ff88")
         self.zoom_label.pack(side=tk.RIGHT, padx=8)
+
+        org = tk.Frame(self, bg="#262626")
+        org.pack(fill=tk.X)
+        tk.Label(org, text="Organize:", bg="#262626", fg="#888888").pack(side=tk.LEFT, padx=(8, 2))
+        for text, cmd in (("Move to... (F6)", self.move_to_folder),
+                          ("Copy to... (F5)", self.copy_to_folder),
+                          ("Batch rename... (Ctrl+F2)", self.batch_rename)):
+            tk.Button(org, text=text, command=cmd, bg="#3a3a3a", fg="white", padx=8).pack(
+                side=tk.LEFT, padx=4, pady=3)
 
         self.path_label = tk.Label(self, text="", bg="#111111", fg="#ffffff", anchor="w", padx=8, pady=4)
         self.path_label.pack(fill=tk.X)
@@ -159,6 +170,9 @@ class BatchCrop(tk.Tk):
         self.bind("<Control-z>", lambda e: self.undo())
         self.bind("<Control-Z>", lambda e: self.undo())
         self.bind("<F2>", lambda e: self.rename_current())
+        self.bind("<Control-F2>", lambda e: self.batch_rename())
+        self.bind("<F5>", lambda e: self.copy_to_folder())
+        self.bind("<F6>", lambda e: self.move_to_folder())
         self.bind("<Control-x>", lambda e: self.cut_current())
         self.bind("<Control-X>", lambda e: self.cut_current())
         self.bind("<Control-c>", lambda e: self.copy_current())
@@ -197,7 +211,7 @@ class BatchCrop(tk.Tk):
 
         help_lbl = tk.Label(
             bottom,
-            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Drag edges/corners: resize   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   Ctrl+Z: undo   Ctrl+X: cut   Ctrl+C: copy",
+            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Drag edges/corners: resize   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   F5/F6: copy/move to   Ctrl+Z: undo   Ctrl+X: cut   Ctrl+C: copy",
             bg="#2d2d2d",
             fg="#888888",
         )
@@ -414,7 +428,7 @@ class BatchCrop(tk.Tk):
 
     def rename_current(self):
         if self.gallery_on and len(self.selection) > 1:
-            self._show_toast("Rename works on one image: select a single image")
+            self.batch_rename()      # like Explorer: F2 on several files renames them together
             return
         path = self._current_path()
         if not path:
@@ -455,6 +469,305 @@ class BatchCrop(tk.Tk):
         self.status.config(text=f"{self.index+1}/{len(self.files)}")
         self._gal_redraw()
         self._show_toast("Renamed: " + new)
+
+    # ------------------------------------------------------------------
+    # Organize: move to / copy to / batch rename
+    # ------------------------------------------------------------------
+    def _ask_dest(self, title):
+        start = self.last_dest if self.last_dest and os.path.isdir(self.last_dest) else (
+            os.path.dirname(self.folder) if self.folder else None)
+        d = filedialog.askdirectory(title=title, initialdir=start, parent=self)
+        if not d:
+            return None
+        d = os.path.normpath(d)
+        self.last_dest = d
+        return d
+
+    def _same_dir(self, a, b):
+        return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+    def _plan_transfer(self, names, dest):
+        """(src, dst) pairs. Never overwrites: asks what to do about name clashes."""
+        items = [(os.path.join(self.folder, n), os.path.join(dest, n)) for n in names]
+        clashes = [n for n in names if os.path.exists(os.path.join(dest, n))]
+        if clashes:
+            ans = messagebox.askyesnocancel(
+                "Name conflicts",
+                f"{len(clashes)} file(s) already exist in the destination (for example {clashes[0]}).\n\n"
+                "Yes = keep both (new copies get _1, _2 ...)\n"
+                "No = skip those files\n"
+                "Cancel = do nothing", parent=self)
+            if ans is None:
+                return None
+            if ans:
+                items = [(src, self._unique_trash_target(dest, os.path.basename(src)) if os.path.exists(dst) else dst)
+                         for src, dst in items]
+            else:
+                items = [(src, dst) for src, dst in items if not os.path.exists(dst)]
+        return items
+
+    def _transfer(self, move):
+        names = self._target_names()
+        if not names:
+            self._show_toast("Nothing to " + ("move" if move else "copy"))
+            return
+        what = names[0] if len(names) == 1 else f"{len(names)} files"
+        dest = self._ask_dest(f"{'Move' if move else 'Copy'} {what} to...")
+        if not dest:
+            return
+        if self._same_dir(dest, self.folder):
+            self._show_toast("Pick a different folder than the current one")
+            return
+        items = self._plan_transfer(names, dest)
+        if not items:
+            if items is not None:
+                self._show_toast("Nothing to do: every file was skipped")
+            return
+        self.config(cursor="watch")
+        self.update_idletasks()
+        done, failed = [], []
+        try:
+            for src, dst in items:
+                try:
+                    if move:
+                        shutil.move(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                    done.append((src, dst))
+                except Exception as e:
+                    failed.append((os.path.basename(src), e))
+        finally:
+            self.config(cursor="")
+        if failed:
+            messagebox.showerror("BatchCrop", f"{len(failed)} file(s) failed:\n{failed[0][0]}: {failed[0][1]}")
+        if not done:
+            return
+        label = os.path.basename(dest) or dest
+        summary = os.path.basename(done[0][0]) if len(done) == 1 else f"{len(done)} files"
+        if move:
+            self._push_undo({"kind": "move_many", "items": done})
+            moved = {os.path.basename(src) for src, _ in done}
+            self.pending_cut = [p for p in self.pending_cut if os.path.basename(p) not in moved]
+            self.sel_anchor = None
+            self._remove_from_list(moved)
+            self.selection = set()
+            self._gal_redraw()
+            self._show_toast(f"Moved {summary} to {label}")
+        else:
+            self._push_undo({"kind": "copy_many", "items": done})
+            self._show_toast(f"Copied {summary} to {label}")
+
+    def move_to_folder(self):
+        self._transfer(move=True)
+
+    def copy_to_folder(self):
+        self._transfer(move=False)
+
+    # --- batch rename -------------------------------------------------
+    _BAD_CHARS = '<>:"/\\|?*'
+    _RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+
+    def _compute_batch(self, names, pattern, start, digits, find, repl):
+        """Preview: list of (old, new, error). Extension is always kept."""
+        out = []
+        for k, old in enumerate(names):
+            stem, ext = os.path.splitext(old)
+            try:
+                mdate = datetime.datetime.fromtimestamp(
+                    os.path.getmtime(os.path.join(self.folder, old))).strftime("%Y-%m-%d")
+            except OSError:
+                mdate = "unknown-date"
+            new_stem = (pattern.replace("{name}", stem)
+                        .replace("{n}", str(start + k).zfill(max(1, digits)))
+                        .replace("{date}", mdate))
+            if find:
+                new_stem = new_stem.replace(find, repl)
+            new = new_stem + ext
+            err = None
+            if not new_stem.strip():
+                err = "empty name"
+            elif any(c in new_stem for c in self._BAD_CHARS):
+                err = "illegal character"
+            elif new_stem.endswith((".", " ")):
+                err = "ends with . or space"
+            elif new_stem.upper() in self._RESERVED:
+                err = "reserved name"
+            out.append((old, new, err))
+        # duplicates inside the batch, and clashes with files that are not part of it
+        seen = {}
+        for i, (old, new, err) in enumerate(out):
+            if err:
+                continue
+            key = os.path.normcase(new)
+            if key in seen:
+                out[i] = (old, new, "duplicate name")
+                j = seen[key]
+                if not out[j][2]:
+                    out[j] = (out[j][0], out[j][1], "duplicate name")
+            else:
+                seen[key] = i
+        batch = {os.path.normcase(o) for o, _, _ in out}
+        for i, (old, new, err) in enumerate(out):
+            if err or new == old:
+                continue
+            if os.path.exists(os.path.join(self.folder, new)) and os.path.normcase(new) not in batch:
+                out[i] = (old, new, "already exists")
+        return out
+
+    def _rename_set(self, pairs):
+        """Rename (old_path, new_path) pairs through temporary names so swaps and
+        chains work; roll everything back if anything fails."""
+        stage1, stage2 = [], []
+        try:
+            for i, (o, n) in enumerate(pairs):
+                tmp = f"{o}.bcr{i}.tmp"
+                k = 0
+                while os.path.exists(tmp):
+                    k += 1
+                    tmp = f"{o}.bcr{i}_{k}.tmp"
+                os.rename(o, tmp)
+                stage1.append((tmp, o, n))
+            for tmp, o, n in stage1:
+                os.rename(tmp, n)
+                stage2.append((tmp, o, n))
+        except Exception:
+            for tmp, o, n in reversed(stage2):
+                try:
+                    os.rename(n, tmp)
+                except OSError:
+                    pass
+            for tmp, o, n in reversed(stage1):
+                try:
+                    os.rename(tmp, o)
+                except OSError:
+                    pass
+            raise
+
+    def _apply_name_changes(self, mapping):
+        """Update list/selection/pending-cut after files were renamed ({old_name: new_name})."""
+        cur = self.files[self.index] if self.files and 0 <= self.index < len(self.files) else None
+        self.files = [mapping.get(f, f) for f in self.files]
+        self.selection = {mapping.get(f, f) for f in self.selection}
+        if self.sel_anchor in mapping:
+            self.sel_anchor = mapping[self.sel_anchor]
+        olds = {os.path.join(self.folder, o): os.path.join(self.folder, n) for o, n in mapping.items()}
+        self.pending_cut = [olds.get(p, p) for p in self.pending_cut]
+        keep = mapping.get(cur, cur)
+        self._sort_files(keep=keep)
+        if self.files:
+            self.path_label.config(text=os.path.normpath(os.path.join(self.folder, self.files[self.index])))
+        self._update_status()
+        self._gal_redraw()
+
+    def _do_rename_many(self, pairs):
+        try:
+            self._rename_set(pairs)
+        except Exception as e:
+            messagebox.showerror("BatchCrop", f"Batch rename failed (nothing was changed):\n{e}")
+            return False
+        self._push_undo({"kind": "rename_many", "items": pairs})
+        self._apply_name_changes({os.path.basename(o): os.path.basename(n) for o, n in pairs})
+        self._show_toast(f"Renamed {len(pairs)} file(s)")
+        return True
+
+    def batch_rename(self):
+        if not self.files or not self.folder:
+            self._show_toast("Open a folder first")
+            return
+        sel_names = self._target_names()
+        dlg = tk.Toplevel(self)
+        self._br_dialog = dlg
+        dlg.title("Batch rename")
+        dlg.configure(bg="#2d2d2d")
+        dlg.transient(self)
+        dlg.grab_set()
+        fg, bg = "#dddddd", "#2d2d2d"
+        scope = tk.StringVar(value="sel")
+        pat = tk.StringVar(value="{name}")
+        start = tk.StringVar(value="1")
+        digits = tk.StringVar(value="3")
+        find = tk.StringVar()
+        repl = tk.StringVar()
+        self._br = {"scope": scope, "pattern": pat, "start": start, "digits": digits, "find": find,
+                    "repl": repl}
+
+        def row(r, text, widget):
+            tk.Label(dlg, text=text, bg=bg, fg=fg, anchor="e").grid(row=r, column=0, sticky="e", padx=(12, 6), pady=3)
+            widget.grid(row=r, column=1, sticky="we", padx=(0, 12), pady=3)
+
+        sc = tk.Frame(dlg, bg=bg)
+        for text, val in ((f"Selected / current ({len(sel_names)})", "sel"),
+                          (f"All images in this folder ({len(self.files)})", "all")):
+            tk.Radiobutton(sc, text=text, variable=scope, value=val, bg=bg, fg=fg, selectcolor="#1e1e1e",
+                           activebackground=bg, activeforeground=fg).pack(side=tk.LEFT, padx=(0, 12))
+        row(0, "Apply to:", sc)
+        row(1, "Pattern:", tk.Entry(dlg, textvariable=pat, width=48))
+        tk.Label(dlg, text="Tokens: {name} original name   {n} counter   {date} modified date   (extension is kept)",
+                 bg=bg, fg="#888888").grid(row=2, column=1, sticky="w", padx=(0, 12))
+        nums = tk.Frame(dlg, bg=bg)
+        tk.Label(nums, text="Start at", bg=bg, fg=fg).pack(side=tk.LEFT)
+        tk.Spinbox(nums, from_=0, to=999999, width=7, textvariable=start).pack(side=tk.LEFT, padx=(4, 14))
+        tk.Label(nums, text="Digits", bg=bg, fg=fg).pack(side=tk.LEFT)
+        tk.Spinbox(nums, from_=1, to=8, width=3, textvariable=digits).pack(side=tk.LEFT, padx=4)
+        row(3, "Counter:", nums)
+        row(4, "Find:", tk.Entry(dlg, textvariable=find, width=48))
+        row(5, "Replace with:", tk.Entry(dlg, textvariable=repl, width=48))
+        box = tk.Frame(dlg, bg=bg)
+        lb = tk.Listbox(box, width=90, height=12, bg="#111111", fg="white", activestyle="none")
+        sb = tk.Scrollbar(box, command=lb.yview)
+        lb.config(yscrollcommand=sb.set)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        box.grid(row=6, column=0, columnspan=2, padx=12, pady=(6, 4), sticky="nsew")
+        info = tk.Label(dlg, text="", bg=bg, fg="#aaaaaa", anchor="w")
+        info.grid(row=7, column=0, columnspan=2, sticky="we", padx=12)
+        btns = tk.Frame(dlg, bg=bg)
+        btns.grid(row=8, column=0, columnspan=2, pady=10)
+        apply_btn = tk.Button(btns, text="Rename", width=12, bg="#2a6", fg="white", disabledforeground="#777777")
+        apply_btn.pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="Cancel", width=12, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+        self._br.update({"listbox": lb, "apply": apply_btn, "info": info})
+
+        def to_int(v, default):
+            try:
+                return int(v.get())
+            except (ValueError, tk.TclError):
+                return default
+
+        state = {"plan": []}
+
+        def refresh(*_):
+            names = list(self.files) if scope.get() == "all" else sel_names
+            plan = self._compute_batch(names, pat.get(), to_int(start, 1), to_int(digits, 1), find.get(), repl.get())
+            state["plan"] = plan
+            lb.delete(0, tk.END)
+            bad = changed = 0
+            for old, new, err in plan:
+                if err:
+                    bad += 1
+                    lb.insert(tk.END, f"{old}   ->   ! {new}   ({err})")
+                    lb.itemconfig(tk.END, foreground="#ff7777")
+                else:
+                    if new != old:
+                        changed += 1
+                    lb.insert(tk.END, f"{old}   ->   {new}" + ("" if new != old else "   (unchanged)"))
+            info.config(text=f"{changed} will be renamed" + (f", {bad} problem(s): fix them to continue" if bad else ""),
+                        fg="#ff7777" if bad else "#aaaaaa")
+            apply_btn.config(state=tk.NORMAL if (changed and not bad) else tk.DISABLED)
+
+        def do_apply():
+            pairs = [(os.path.join(self.folder, o), os.path.join(self.folder, n))
+                     for o, n, err in state["plan"] if not err and n != o]
+            dlg.destroy()
+            if pairs:
+                self._do_rename_many(pairs)
+
+        apply_btn.config(command=do_apply)
+        for v in (pat, start, digits, find, repl, scope):
+            v.trace_add("write", refresh)
+        refresh()
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        self.wait_window(dlg)
 
     # ------------------------------------------------------------------
     # Undo
@@ -570,6 +883,46 @@ class BatchCrop(tk.Tk):
                     self.selection = set(names)
                     self._gal_redraw()
                 msg = "Restored: " + (names[0] if len(names) == 1 else f"{len(names)} files")
+            elif kind == "move_many":
+                items = entry["items"]
+                for src, dst in items:
+                    if not os.path.exists(dst):
+                        raise FileNotFoundError(f"{os.path.basename(dst)} is no longer in {os.path.dirname(dst)}")
+                    if os.path.exists(src):
+                        raise FileExistsError(f"{os.path.basename(src)} already exists in the original folder")
+                for src, dst in items:
+                    shutil.move(dst, src)
+                back = [os.path.basename(src) for src, _ in items if self._same_dir(os.path.dirname(src), self.folder)]
+                for n in back:
+                    if n not in self.files:
+                        self.files.append(n)
+                if back:
+                    self._select_file(back[0])
+                    if self.gallery_on:
+                        self.selection = set(back)
+                        self._gal_redraw()
+                msg = "Moved back: " + (back[0] if len(back) == 1 else f"{len(items)} files")
+            elif kind == "copy_many":
+                # copies go to the destination's trash folder instead of being deleted
+                moved = 0
+                for _, dst in entry["items"]:
+                    if os.path.exists(dst):
+                        tdir = os.path.join(os.path.dirname(dst), ".batchcrop_trash")
+                        os.makedirs(tdir, exist_ok=True)
+                        shutil.move(dst, self._unique_trash_target(tdir, os.path.basename(dst)))
+                        moved += 1
+                msg = f"Undid copy ({moved} file(s) moved to the destination's .batchcrop_trash)"
+            elif kind == "rename_many":
+                items = entry["items"]          # (old_path, new_path)
+                newset = {os.path.normcase(n) for _, n in items}
+                for old, new in items:
+                    if not os.path.exists(new):
+                        raise FileNotFoundError(f"{os.path.basename(new)} no longer exists")
+                    if os.path.exists(old) and os.path.normcase(old) not in newset:
+                        raise FileExistsError(f"{os.path.basename(old)} already exists")
+                self._rename_set([(n, o) for o, n in items])
+                self._apply_name_changes({os.path.basename(n): os.path.basename(o) for o, n in items})
+                msg = f"Undid rename of {len(items)} files"
             elif kind == "delete":
                 path, trash = entry["path"], entry["trash"]
                 if not os.path.exists(trash):

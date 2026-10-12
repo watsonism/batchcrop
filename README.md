@@ -12,6 +12,10 @@ A minimal, keyboard-driven desktop app for manually cropping screenshots in bulk
 - `Left Arrow` — previous image
 - `Up/Down Arrow` — skip current image without cropping
 - `Esc` — clear current crop selection
+- **Organize** row (works on the gallery selection, or the current image if nothing is selected):
+  - `Move to...` / `F6` — move the files to another folder (works across drives). Name clashes never overwrite: you choose keep both (`_1`, `_2`...), skip those, or cancel. Undoable.
+  - `Copy to...` / `F5` — copy to another folder with the same clash handling, no Explorer needed. Undo moves the copies into the destination's `.batchcrop_trash` (nothing is permanently deleted).
+  - `Batch rename...` / `Ctrl+F2` (or `F2` with several selected) — pattern with `{name}`, `{n}` counter (start and digit padding), `{date}` (modified date), plus find/replace; applies to the selection or the whole folder. Live preview, problems (duplicates, illegal characters, existing files) are flagged and block the rename; swaps and chains are safe. The extension is always kept. Undoable.
 - `Undo` button / `Ctrl+Z` — undo the last crop-box edit on the current image, then (newest first) saved crops (original restored, with its timestamps), deletes (file restored from `.batchcrop_trash`) and renames; up to 50 steps, cleared when you open another folder. Cut/paste moves done in Explorer are not undoable here
 - `Keep crop` checkbox / `K` — after saving a crop, the same crop box (same size and position) appears on the next image so you can just drag it up or down; if an image is too small it is shrunk to fit with the same ratio. `Esc` forgets it
 - Drag a crop box's edges or corners (white handles) to resize it; Shift while resizing keeps its ratio. Drag inside the box to move it
