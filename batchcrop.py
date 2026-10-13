@@ -60,12 +60,21 @@ class CrashReporter:
 
     # --- where reports live ---
     @staticmethod
+    def fallback_directory():
+        """Per-user folder used when the folder next to the app is not writable."""
+        if platform.system() == "Windows":
+            root = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+            return os.path.join(root, "BatchCrop", CRASH_DIR_NAME)
+        # Linux / other Unix: XDG state dir (~/.local/state/batchcrop/crash-reports by default)
+        state = os.environ.get("XDG_STATE_HOME")
+        if not state or not os.path.isabs(state):
+            state = os.path.join(os.path.expanduser("~"), ".local", "state")
+        return os.path.join(state, "batchcrop", CRASH_DIR_NAME)
+
+    @staticmethod
     def directory():
         base = _APP_DIR
-        candidates = [
-            os.path.join(base, CRASH_DIR_NAME),
-            os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "BatchCrop", CRASH_DIR_NAME),
-        ]
+        candidates = [os.path.join(base, CRASH_DIR_NAME), CrashReporter.fallback_directory()]
         for d in candidates:
             try:
                 os.makedirs(d, exist_ok=True)

@@ -53,7 +53,8 @@ MIT.
 ## Crash reports
 
 If BatchCrop hits an unexpected error it writes a text report to a `crash-reports` folder next to `BatchCrop.exe`
-(or to `%LOCALAPPDATA%\BatchCrop\crash-reports` if that folder is not writable). Nothing is sent over the network.
+(or, if that folder is not writable, to `%LOCALAPPDATA%\BatchCrop\crash-reports` on Windows and
+`~/.local/state/batchcrop/crash-reports` on Linux, honoring `$XDG_STATE_HOME`). Nothing is sent over the network.
 
 - Covers errors inside button and key handlers (which a windowed app would otherwise swallow silently), unhandled
   errors on the main thread and in worker threads, and hard crashes (the report is written on the next launch).
