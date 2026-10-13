@@ -1,9 +1,16 @@
 import atexit
+import collections
 import datetime
+import faulthandler
+import functools
+import getpass
 import os
 import platform
 import re
 import shutil
+import sys
+import threading
+import traceback
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +29,291 @@ THUMB = 150
 G_PAD = 10
 G_CELL_W = THUMB + 2 * G_PAD
 G_CELL_H = THUMB + 2 * G_PAD + 20
+
+
+# ----------------------------------------------------------------------
+# Crash reports: redacted text files written next to the exe (crash-reports\)
+# ----------------------------------------------------------------------
+APP_VERSION = "1.0"
+# Resolved once at import: __file__ is not reliably available later (e.g. in sys.excepthook at exit)
+_APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+CRASH_DIR_NAME = "crash-reports"
+CRUMB_METHODS = (
+    "open_folder", "refresh_folder", "toggle_gallery", "apply_sort", "load_image", "next", "prev",
+    "save_crop", "delete_current", "_do_delete_many", "undo", "cut_current", "copy_current",
+    "rename_current", "batch_rename", "move_to_folder", "copy_to_folder", "select_all",
+    "zoom_by", "zoom_reset", "open_in_explorer", "_do_rename_many", "_transfer",
+)
+_FILE_EXTS = r"(?:png|jpe?g|bmp|gif|webp|tiff?|clip|txt|csv|json|zip|bak|tmp|md|pdf)"
+
+
+class CrashReporter:
+    """Writes a redacted report for unhandled errors. Never raises, never phones home."""
+
+    def __init__(self):
+        self.app = None
+        self.crumbs = collections.deque(maxlen=40)
+        self.seen = {}
+        self.fault_file = None
+        self.quiet = False          # no dialogs (used by --crash-test)
+        self._lock = threading.Lock()
+
+    # --- where reports live ---
+    @staticmethod
+    def directory():
+        base = _APP_DIR
+        candidates = [
+            os.path.join(base, CRASH_DIR_NAME),
+            os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "BatchCrop", CRASH_DIR_NAME),
+        ]
+        for d in candidates:
+            try:
+                os.makedirs(d, exist_ok=True)
+                probe = os.path.join(d, ".w")
+                with open(probe, "w") as f:
+                    f.write("")
+                os.remove(probe)
+                return d
+            except OSError:
+                continue
+        return None
+
+    # --- breadcrumbs: names of actions only, never file names ---
+    def crumb(self, name):
+        self.crumbs.append((time.time(), name))
+
+    def install_breadcrumbs(self, app):
+        for name in CRUMB_METHODS:
+            orig = getattr(app, name, None)
+            if orig is None:
+                continue
+
+            def make(n, fn):
+                @functools.wraps(fn)
+                def wrapper(*a, **k):
+                    self.crumb(n)
+                    return fn(*a, **k)
+                return wrapper
+            setattr(app, name, make(name, orig))
+
+    # --- redaction ---
+    def _known_names(self):
+        a = self.app
+        names, folders = set(), set()
+        if a is None:
+            return names, folders
+        try:
+            names |= set(getattr(a, "files", []) or [])
+            names |= set(getattr(a, "selection", set()) or set())
+            for p in list(getattr(a, "pending_cut", []) or []):
+                names.add(os.path.basename(p))
+            for e in list(getattr(a, "undo_stack", []) or []):
+                for v in e.values():
+                    vals = v if isinstance(v, (list, tuple)) else [v]
+                    for x in vals:
+                        for y in (x if isinstance(x, (list, tuple)) else [x]):
+                            if isinstance(y, str) and os.sep in y or isinstance(y, str) and "/" in y:
+                                names.add(os.path.basename(y))
+                                folders.add(os.path.dirname(y))
+            for f in (getattr(a, "folder", None), getattr(a, "last_dest", None)):
+                if f:
+                    folders.add(f)
+        except Exception:
+            pass
+        return {n for n in names if n and len(n) >= 3}, {f for f in folders if f and len(f) >= 3}
+
+    def redact(self, text, message=False):
+        names, folders = self._known_names()
+        out = text
+        # 1) full folder paths, then their last component
+        fold_list = sorted(folders | {os.path.normpath(f) for f in folders} | {f.replace("\\", "/") for f in folders},
+                           key=len, reverse=True)
+        for f in fold_list:
+            out = out.replace(f, "<folder>")
+        for f in sorted({os.path.basename(os.path.normpath(f)) for f in folders if os.path.basename(os.path.normpath(f))},
+                        key=len, reverse=True):
+            if len(f) >= 3:
+                out = out.replace(f, "<folder>")
+        # 2) file names we know about, keeping the extension
+        counter = 0
+        for n in sorted(names, key=len, reverse=True):
+            if n in out:
+                counter += 1
+                ext = os.path.splitext(n)[1]
+                out = out.replace(n, f"<file{counter}>{ext}")
+        # 3) any other absolute path: keep python source paths, hide everything else
+        def path_sub(m):
+            p = m.group(0)
+            if p.lower().endswith(".py"):
+                parts = re.split(r"[\\/]", p)
+                return ".../" + "/".join(parts[-2:])
+            ext = os.path.splitext(p)[1]
+            return "<path>" + (ext if re.fullmatch(r"\.[A-Za-z0-9]{1,5}", ext or "") else "")
+        out = re.sub(r"[A-Za-z]:[\\/](?:[^\\/\s\"'<>|*?:]+[\\/])*[^\\/\s\"'<>|*?:,;)\]]*", path_sub, out)
+        out = re.sub(r"\\\\[^\\\s]+\\[^\s\"']*", "<path>", out)
+        out = re.sub(r"(?<![\w<.])/(?:[^\s\"'/<>]+/)+[^\s\"'/<>]*", path_sub, out)
+        # 4) quoted file-looking names inside an exception message
+        if message:
+            out = re.sub(r"""(['"])([^'"\n]*[^'"\n.]\.""" + _FILE_EXTS + r""")\1""",
+                         lambda m: f"{m.group(1)}<file>{os.path.splitext(m.group(2))[1]}{m.group(1)}", out,
+                         flags=re.IGNORECASE)
+        # 5) user / machine names
+        secrets = set()
+        for fn in (getpass.getuser, platform.node):
+            try:
+                secrets.add(fn())
+            except Exception:
+                pass
+        secrets.add(os.environ.get("USERNAME", ""))
+        for sct in sorted((x for x in secrets if x and len(x) >= 3), key=len, reverse=True):
+            out = re.sub(re.escape(sct), "<user>", out, flags=re.IGNORECASE)
+        return out
+
+    # --- report body ---
+    def _state(self):
+        a = self.app
+        if a is None:
+            return ["app: not created yet (crashed during startup)"]
+        lines = []
+
+        def g(label, fn):
+            try:
+                lines.append(f"{label}: {fn()}")
+            except Exception as e:
+                lines.append(f"{label}: <unavailable: {type(e).__name__}>")
+        g("view", lambda: "gallery" if a.gallery_on else "single image")
+        g("files in list", lambda: len(a.files))
+        g("current index", lambda: a.index)
+        g("selected", lambda: len(a.selection))
+        g("sort", lambda: a.sort_var.get())
+        g("keep crop", lambda: a.keep_crop_var.get())
+        g("zoom", lambda: round(a.zoom, 3))
+        g("image size", lambda: f"{a.image.width}x{a.image.height}" if a.image else "none")
+        g("crop box set", lambda: bool(a.crop))
+        g("undo steps (files / crop box)", lambda: f"{len(a.undo_stack)} / {len(a.crop_hist)}")
+        g("pending cut files", lambda: len(a.pending_cut))
+        g("thumbnails cached / pending / unreadable",
+          lambda: f"{len(a.thumb_cache)} / {len(a.thumb_pending)} / {len(a.thumb_failed)}")
+        g("window", lambda: a.geometry().split("+")[0])
+        return lines
+
+    def build(self, exc_type, exc, tb, source, fatal):
+        now = datetime.datetime.now()
+        msg = "".join(traceback.format_exception_only(exc_type, exc)).strip() if exc_type else "(no exception)"
+        # keep only the "File ..., line N, in func" lines: source snippets could quote private text
+        frames = "".join(l for l in traceback.format_tb(tb) for l in l.splitlines(True) if l.startswith("  File ")) if tb else ""
+        built = ""
+        try:
+            built = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(sys.executable)))
+        except OSError:
+            pass
+        head = [
+            "BatchCrop crash report (redacted: no file names, folder names or user name)",
+            f"time: {now.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"app version: {APP_VERSION}   exe built: {built or 'n/a'}   frozen: {bool(getattr(sys, 'frozen', False))}",
+            f"python: {platform.python_version()}   os: {platform.platform()}",
+            f"source: {source}   fatal: {fatal}   thread: {threading.current_thread().name}",
+            "",
+            "== error ==",
+            self.redact(msg, message=True),
+            "",
+            "== traceback ==",
+            self.redact(frames) or "(none)",
+            "",
+            "== app state ==",
+        ]
+        state = [self.redact(x, message=True) for x in self._state()]
+        t = time.time()
+        crumbs = [f"  -{t - ts:6.1f}s  {name}" for ts, name in list(self.crumbs)]
+        return "\n".join(head + state + ["", "== last actions (oldest first, seconds before the crash) =="] +
+                         (crumbs or ["  (none)"]) + [""])
+
+    def write(self, text):
+        d = self.directory()
+        if d is None:
+            return None
+        base = datetime.datetime.now().strftime("crash_%Y%m%d_%H%M%S")
+        path = os.path.join(d, base + ".txt")
+        n = 1
+        while os.path.exists(path):
+            n += 1
+            path = os.path.join(d, f"{base}_{n}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    # --- entry points ---
+    def handle(self, exc_type, exc, tb, source="main", fatal=False):
+        try:
+            with self._lock:
+                last = traceback.extract_tb(tb)[-1] if tb else None
+                sig = f"{getattr(exc_type, '__name__', exc_type)}@{last.filename.split(chr(92))[-1].split('/')[-1] if last else ''}:{last.lineno if last else 0}"
+                self.seen[sig] = self.seen.get(sig, 0) + 1
+                if self.seen[sig] > 1:
+                    return None          # same error again this session: one report is enough
+                path = self.write(self.build(exc_type, exc, tb, source, fatal))
+            self._tell_user(path, fatal)
+            return path
+        except Exception:
+            if os.environ.get("BATCHCROP_DEBUG"):
+                traceback.print_exc()
+            return None
+
+    def _tell_user(self, path, fatal):
+        if self.quiet or path is None:
+            return
+        try:
+            a = self.app
+            if fatal or a is None:
+                try:
+                    root = a if a is not None else tk.Tk()
+                    if a is None:
+                        root.withdraw()
+                    messagebox.showerror("BatchCrop crashed",
+                                         f"BatchCrop hit an unexpected error and needs to close.\n\n"
+                                         f"A redacted crash report was saved to:\n{path}", parent=root if a else None)
+                except Exception:
+                    pass
+            elif a is not None:
+                a.after_idle(lambda: a._show_toast("Error caught: crash report saved"))
+        except Exception:
+            pass
+
+    def hook_main(self, exc_type, exc, tb):
+        self.handle(exc_type, exc, tb, source="unhandled (main thread)", fatal=True)
+
+    def hook_thread(self, args):
+        self.handle(args.exc_type, args.exc_value, args.exc_traceback,
+                    source=f"unhandled (thread {getattr(args.thread, 'name', '?')})", fatal=False)
+
+    def ingest_native_log(self):
+        """A hard crash (segfault) leaves a faulthandler log; turn it into a redacted report."""
+        d = self.directory()
+        if d is None:
+            return
+        log = os.path.join(d, ".faulthandler.log")
+        try:
+            if os.path.exists(log) and os.path.getsize(log) > 0:
+                with open(log, "r", encoding="utf-8", errors="replace") as f:
+                    raw = f.read()
+                body = ["BatchCrop crash report (redacted)", "type: hard crash of the previous run (native fault)",
+                        f"detected: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        f"python: {platform.python_version()}   os: {platform.platform()}", "",
+                        "== python stack at the time of the fault ==", self.redact(raw), ""]
+                self.write("\n".join(body))
+                open(log, "w").close()
+            self.fault_file = open(log, "a", encoding="utf-8")
+            faulthandler.enable(file=self.fault_file, all_threads=True)
+        except Exception:
+            self.fault_file = None
+
+    def install(self):
+        sys.excepthook = self.hook_main
+        threading.excepthook = self.hook_thread
+        self.ingest_native_log()
+
+
+CRASH = CrashReporter()
 
 
 def _natural_key(name):
@@ -82,8 +374,14 @@ class BatchCrop(tk.Tk):
         self.thumb_job = None
         self.thumb_pool = ThreadPoolExecutor(max_workers=2)
 
+        CRASH.app = self
+        CRASH.install_breadcrumbs(self)
         self._build_ui()
         self.bind("<Configure>", lambda e: self.after_idle(self._fit_image))
+
+    def report_callback_exception(self, exc, val, tb):
+        """Tk swallows errors from callbacks (silently in a windowed exe): report them instead."""
+        CRASH.handle(exc, val, tb, source="tk callback", fatal=False)
 
     # ------------------------------------------------------------------
     # UI
@@ -1972,6 +2270,18 @@ class BatchCrop(tk.Tk):
         self.next()
 
 
+def _deliberate_crash():
+    raise RuntimeError("deliberate crash for testing the crash reporter")
+
+
 if __name__ == "__main__":
+    CRASH.install()
+    if "--crash-test" in sys.argv or "--crash-test-fatal" in sys.argv:
+        CRASH.quiet = True      # no dialogs; the app closes itself
     app = BatchCrop()
+    if "--crash-test" in sys.argv:
+        app.after(300, _deliberate_crash)       # error inside a Tk callback
+        app.after(1500, app.destroy)
+    elif "--crash-test-fatal" in sys.argv:
+        _deliberate_crash()                     # unhandled in the main thread
     app.mainloop()

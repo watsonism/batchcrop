@@ -49,3 +49,18 @@ pyinstaller --onefile --windowed --name BatchCrop batchcrop.py
 ## Project
 
 MIT.
+
+## Crash reports
+
+If BatchCrop hits an unexpected error it writes a text report to a `crash-reports` folder next to `BatchCrop.exe`
+(or to `%LOCALAPPDATA%\BatchCrop\crash-reports` if that folder is not writable). Nothing is sent over the network.
+
+- Covers errors inside button and key handlers (which a windowed app would otherwise swallow silently), unhandled
+  errors on the main thread and in worker threads, and hard crashes (the report is written on the next launch).
+- Reports are redacted: no file names, folder names or user name. They contain the error, a traceback (file and line
+  numbers only), app and Windows versions, a summary of the app state (counts, view, sort, zoom) and the last ~40
+  action names.
+- The same error repeating in one session is only reported once. For a non-fatal error a toast says a report was
+  saved; for a fatal one a dialog shows where it is.
+- `BatchCrop.exe --crash-test` raises a deliberate error to check the reporter, then closes itself.
+  `--crash-test-fatal` does the same for an unhandled main-thread crash.
