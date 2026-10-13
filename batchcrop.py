@@ -5,6 +5,7 @@ import platform
 import re
 import shutil
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import tkinter as tk
@@ -58,6 +59,9 @@ class BatchCrop(tk.Tk):
         self.rb_xy = (0, 0)
         self.rb_job = None
         self.toast_text = ""
+        self.thumb_failed = set()   # thumbnail keys that could not be read
+        self._last_focus_check = 0.0
+        self._refresh_job = None
         self.last_dest = None      # last folder used by Move to / Copy to
         self.zoom = 1.0
         self.pan = (0, 0)
@@ -92,6 +96,8 @@ class BatchCrop(tk.Tk):
                   bg="#3a3a3a", fg="white", padx=8).pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(top, text="Open in File Explorer", command=self.open_in_explorer,
                   bg="#3a3a3a", fg="white", padx=8).pack(side=tk.LEFT, padx=4, pady=4)
+        tk.Button(top, text="Refresh (F5)", command=self.refresh_folder,
+                  bg="#3a3a3a", fg="white", padx=8).pack(side=tk.LEFT, padx=4, pady=4)
         self.sort_menu = tk.OptionMenu(top, self.sort_var, *SORT_MODES, command=lambda _v: self.apply_sort())
         self.sort_menu.config(bg="#3a3a3a", fg="white", activebackground="#4a4a4a", activeforeground="white",
                               highlightthickness=0)
@@ -111,7 +117,7 @@ class BatchCrop(tk.Tk):
         org.pack(fill=tk.X)
         tk.Label(org, text="Organize:", bg="#262626", fg="#888888").pack(side=tk.LEFT, padx=(8, 2))
         for text, cmd in (("Move to... (F6)", self.move_to_folder),
-                          ("Copy to... (F5)", self.copy_to_folder),
+                          ("Copy to... (F7)", self.copy_to_folder),
                           ("Batch rename... (Ctrl+F2)", self.batch_rename)):
             tk.Button(org, text=text, command=cmd, bg="#3a3a3a", fg="white", padx=8).pack(
                 side=tk.LEFT, padx=4, pady=3)
@@ -171,8 +177,10 @@ class BatchCrop(tk.Tk):
         self.bind("<Control-Z>", lambda e: self.undo())
         self.bind("<F2>", lambda e: self.rename_current())
         self.bind("<Control-F2>", lambda e: self.batch_rename())
-        self.bind("<F5>", lambda e: self.copy_to_folder())
+        self.bind("<F5>", lambda e: self.refresh_folder())
         self.bind("<F6>", lambda e: self.move_to_folder())
+        self.bind("<F7>", lambda e: self.copy_to_folder())
+        self.bind("<FocusIn>", self._on_focus_in)
         self.bind("<Control-x>", lambda e: self.cut_current())
         self.bind("<Control-X>", lambda e: self.cut_current())
         self.bind("<Control-c>", lambda e: self.copy_current())
@@ -211,7 +219,7 @@ class BatchCrop(tk.Tk):
 
         help_lbl = tk.Label(
             bottom,
-            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Drag edges/corners: resize   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   F5/F6: copy/move to   Ctrl+Z: undo   Ctrl+X: cut   Ctrl+C: copy",
+            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Drag edges/corners: resize   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   F5: refresh   F6/F7: move/copy to   Ctrl+Z: undo   Ctrl+X: cut   Ctrl+C: copy",
             bg="#2d2d2d",
             fg="#888888",
         )
@@ -469,6 +477,75 @@ class BatchCrop(tk.Tk):
         self.status.config(text=f"{self.index+1}/{len(self.files)}")
         self._gal_redraw()
         self._show_toast("Renamed: " + new)
+
+    # ------------------------------------------------------------------
+    # Refresh (F5): re-read the folder so moved / added / deleted files show correctly
+    # ------------------------------------------------------------------
+    def _scan_folder(self):
+        return [
+            f for f in os.listdir(self.folder)
+            if os.path.splitext(f)[1].lower() in SUPPORTED and os.path.isfile(os.path.join(self.folder, f))
+        ]
+
+    def _on_focus_in(self, event):
+        """Coming back from Explorer: refresh if the folder changed behind our back."""
+        if event.widget is not self or not self.folder:
+            return
+        now = time.time()
+        if now - self._last_focus_check < 1.0:
+            return
+        self._last_focus_check = now
+        try:
+            if set(self._scan_folder()) != set(self.files):
+                self.refresh_folder()
+        except OSError:
+            pass
+
+    def refresh_folder(self, quiet=False):
+        self._refresh_job = None
+        if not self.folder:
+            if not quiet:
+                self._show_toast("Open a folder first")
+            return False
+        if not os.path.isdir(self.folder):
+            self._show_toast("The folder no longer exists")
+            return False
+        try:
+            listing = self._scan_folder()
+        except OSError as e:
+            messagebox.showerror("BatchCrop", f"Could not read the folder:\n{e}")
+            return False
+        old, new = set(self.files), set(listing)
+        added, gone = len(new - old), len(old - new)
+        self.thumb_failed.clear()          # give unreadable files another chance
+        for k in [k for k in self.thumb_cache if not os.path.exists(k[0])]:
+            del self.thumb_cache[k]
+        if not listing:
+            self.pending_cut = []
+            self._remove_from_list(old)
+            self._show_toast("Refreshed: no images left in this folder")
+            return True
+        old_index = self.index
+        cur = self.files[old_index] if 0 <= old_index < len(self.files) else None
+        self.files = listing
+        self.selection &= new
+        self.pending_cut = [p for p in self.pending_cut if os.path.exists(p)]
+        self._sort_files(keep=cur if cur in new else None)
+        if cur in new:
+            changed_current = False
+        else:
+            self.index = min(old_index, len(self.files) - 1)
+            changed_current = True
+        if not self.image or changed_current:
+            self.load_image()              # redraws the gallery too
+        else:
+            self._update_status()
+            self._gal_redraw(ensure_visible=True)
+        if added or gone:
+            self._show_toast(f"Refreshed: {added} new, {gone} gone")
+        elif not quiet:
+            self._show_toast("Refreshed: no changes")
+        return bool(added or gone)
 
     # ------------------------------------------------------------------
     # Organize: move to / copy to / batch rename
@@ -1082,6 +1159,10 @@ class BatchCrop(tk.Tk):
         cx = x + G_CELL_W // 2
         if photo is not None:
             c.create_image(cx, y + G_PAD + THUMB // 2, image=photo)
+        elif key in self.thumb_failed:
+            c.create_rectangle(cx - THUMB // 2, y + G_PAD, cx + THUMB // 2, y + G_PAD + THUMB,
+                               fill="#3a1f1f", outline="#552222")
+            c.create_text(cx, y + G_PAD + THUMB // 2, text="unreadable", fill="#cc7777")
         else:
             c.create_text(cx, y + G_PAD + THUMB // 2, text="...", fill="#666666")
             self._thumb_request(key)
@@ -1109,12 +1190,18 @@ class BatchCrop(tk.Tk):
         done = [k for k, f in self.thumb_pending.items() if f.done()]
         if len(self.thumb_cache) > 800:
             self.thumb_cache.clear()
+        missing = False
         for k in done:
             f = self.thumb_pending.pop(k)
             try:
                 self.thumb_cache[k] = ImageTk.PhotoImage(f.result())
             except Exception:
-                self.thumb_cache[k] = ImageTk.PhotoImage(Image.new("RGB", (THUMB, THUMB), "#552222"))
+                if not os.path.exists(k[0]):
+                    missing = True         # the file left the folder: the list is stale
+                else:
+                    self.thumb_failed.add(k)   # exists but unreadable: show it as such, don't retry forever
+        if missing and self._refresh_job is None:
+            self._refresh_job = self.after_idle(lambda: self.refresh_folder(quiet=True))
         if done:
             self._gal_redraw()
         if self.thumb_pending:
