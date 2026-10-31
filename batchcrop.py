@@ -47,6 +47,159 @@ CRUMB_METHODS = (
 _FILE_EXTS = r"(?:png|jpe?g|bmp|gif|webp|tiff?|clip|txt|csv|json|zip|bak|tmp|md|pdf)"
 
 
+# ----------------------------------------------------------------------
+# Windows file drag: a real OLE drag (DoDragDrop) so Explorer and other
+# drop targets receive the file. Only called on win32; ctypes only.
+# ----------------------------------------------------------------------
+_OLE_S_OK = 0
+_OLE_E_NOTIMPL = 0x80004001
+_OLE_E_NOINTERFACE = 0x80004002
+_OLE_DV_E_FORMATETC = 0x80040064
+_OLE_ADVISE_NOTSUPP = 0x80040003
+_DRAGDROP_S_DROP = 0x00040100
+_DRAGDROP_S_CANCEL = 0x00040101
+_DRAGDROP_S_USEDEFAULTCURSORS = 0x00040102
+_MK_LBUTTON = 0x0001
+_CF_HDROP = 15
+_TYMED_HGLOBAL = 1
+_DROPEFFECT_COPY = 1
+_IID_IUNKNOWN = "00000000-0000-0000-C000-000000000046"
+_IID_IDATAOBJECT = "0000010E-0000-0000-C000-000000000046"
+_IID_IDROPSOURCE = "00000121-0000-0000-C000-000000000046"
+
+
+def _win_hdrop_blob(path):
+    """CF_HDROP payload: DROPFILES header (20 bytes, wide) + double-NUL path list."""
+    import struct
+    p = os.path.normpath(os.path.abspath(path))
+    header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+    return header + (p + "\0\0").encode("utf-16-le")
+
+
+class _ComVTable:
+    """Minimal COM object: one vtable of ctypes callbacks. sigs = [(restype, *argtypes), fn]."""
+
+    def __init__(self, methods):
+        import ctypes
+        self._cbs = [ctypes.WINFUNCTYPE(*sig)(fn) for sig, fn in methods]
+        self._vtbl = (ctypes.c_void_p * len(self._cbs))(
+            *[ctypes.cast(cb, ctypes.c_void_p).value for cb in self._cbs])
+        self._vptr = ctypes.c_void_p(ctypes.addressof(self._vtbl))
+        self.ptr = ctypes.addressof(self._vptr)  # 'this' pointer
+
+
+def _win_file_drag(path):
+    """Start an OLE file drag for path. Blocks until drop/cancel. Returns HRESULT."""
+    import ctypes
+    import uuid
+    from ctypes import wintypes
+
+    class FORMATETC(ctypes.Structure):
+        _fields_ = [("cfFormat", wintypes.WORD), ("ptd", ctypes.c_void_p),
+                    ("dwAspect", wintypes.DWORD), ("lindex", wintypes.LONG),
+                    ("tymed", wintypes.DWORD)]
+
+    class STGMEDIUM(ctypes.Structure):
+        _fields_ = [("tymed", wintypes.DWORD), ("hGlobal", ctypes.c_void_p),
+                    ("pUnkForRelease", ctypes.c_void_p)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ole32 = ctypes.WinDLL("ole32")
+    k32.GlobalAlloc.restype = ctypes.c_void_p
+    k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalLock.argtypes = [ctypes.c_void_p]
+    k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    k32.GlobalFree.argtypes = [ctypes.c_void_p]
+    ole32.OleInitialize.restype = ctypes.c_long
+    ole32.OleInitialize.argtypes = [ctypes.c_void_p]
+    ole32.DoDragDrop.restype = ctypes.c_long
+    ole32.DoDragDrop.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD)]
+
+    blob = _win_hdrop_blob(path)
+    GMEM_MOVEABLE, GMEM_ZEROINIT = 0x0002, 0x0040
+
+    def hglobal_copy(data):
+        h = k32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(data))
+        if not h:
+            raise OSError("GlobalAlloc failed")
+        ptr = k32.GlobalLock(h)
+        if not ptr:
+            k32.GlobalFree(h)
+            raise OSError("GlobalLock failed")
+        ctypes.memmove(ptr, data, len(data))
+        k32.GlobalUnlock(h)
+        return h
+
+    def is_hdrop(fe):
+        return fe.cfFormat == _CF_HDROP and bool(fe.tymed & _TYMED_HGLOBAL)
+
+    def qi(accepted):
+        def _qi(this, riid, ppv):
+            raw = ctypes.string_at(riid, 16)
+            out = ctypes.cast(ppv, ctypes.POINTER(ctypes.c_void_p))
+            if any(raw == uuid.UUID(s).bytes_le for s in accepted):
+                out[0] = this
+                return _OLE_S_OK
+            out[0] = None
+            return _OLE_E_NOINTERFACE
+        return _qi
+
+    def ref(this):
+        return 1
+
+    def notimpl(*args):
+        return _OLE_E_NOTIMPL
+
+    def advise_unsupported(*args):
+        return _OLE_ADVISE_NOTSUPP
+
+    def getdata(this, pfe, pmed):
+        if not is_hdrop(pfe.contents):
+            return _OLE_DV_E_FORMATETC
+        pmed.contents.tymed = _TYMED_HGLOBAL
+        pmed.contents.hGlobal = hglobal_copy(blob)
+        pmed.contents.pUnkForRelease = None  # receiver frees the HGLOBAL
+        return _OLE_S_OK
+
+    def querygetdata(this, pfe):
+        return _OLE_S_OK if is_hdrop(pfe.contents) else _OLE_DV_E_FORMATETC
+
+    FE_P = ctypes.POINTER(FORMATETC)
+    ST_P = ctypes.POINTER(STGMEDIUM)
+    LONG, ULONG, PTR, DW = ctypes.c_long, ctypes.c_ulong, ctypes.c_void_p, wintypes.DWORD
+
+    data_methods = [
+        ((LONG, PTR, PTR, PTR), qi([_IID_IUNKNOWN, _IID_IDATAOBJECT])),
+        ((ULONG, PTR), ref),
+        ((ULONG, PTR), ref),
+        ((LONG, PTR, FE_P, ST_P), getdata),
+        ((LONG, PTR, FE_P, ST_P), notimpl),
+        ((LONG, PTR, FE_P), querygetdata),
+        ((LONG, PTR, FE_P, FE_P), notimpl),
+        ((LONG, PTR, FE_P, ST_P, wintypes.BOOL), notimpl),
+        ((LONG, PTR, DW, PTR), notimpl),
+        ((LONG, PTR, FE_P, DW, PTR, PTR), advise_unsupported),
+        ((LONG, PTR, DW), advise_unsupported),
+        ((LONG, PTR, PTR), advise_unsupported),
+    ]
+    source_methods = [
+        ((LONG, PTR, PTR, PTR), qi([_IID_IUNKNOWN, _IID_IDROPSOURCE])),
+        ((ULONG, PTR), ref),
+        ((ULONG, PTR), ref),
+        ((LONG, PTR, wintypes.BOOL, DW),
+         lambda this, esc, keys: 0x00040101 if esc else (0x00040100 if not (keys & _MK_LBUTTON) else _OLE_S_OK)),
+        ((LONG, PTR, DW), lambda this, effect: _DRAGDROP_S_USEDEFAULTCURSORS),
+    ]
+
+    data = _ComVTable(data_methods)
+    source = _ComVTable(source_methods)
+    effect = wintypes.DWORD(0)
+    ole32.OleInitialize(None)  # S_OK or S_FALSE (already initialised) are both fine
+    return ole32.DoDragDrop(data.ptr, source.ptr, _DROPEFFECT_COPY, ctypes.byref(effect))
+
+
 class CrashReporter:
     """Writes a redacted report for unhandled errors. Never raises, never phones home."""
 
@@ -378,7 +531,9 @@ class BatchCrop(tk.Tk):
         self.gallery_on = False
         self.keep_crop_var = tk.BooleanVar(value=False)
         self.drag_drop_var = tk.BooleanVar(value=False)
-        self._drag_handle = None
+        self._drag_box = None
+        self._handle_press = False
+        self._drag_path = None
         self.last_crop = None
         self.drag_ratio = 1.0
         self.thumb_cache = {}
@@ -835,9 +990,8 @@ class BatchCrop(tk.Tk):
             del self.thumb_cache[k]
         if not listing:
             self.pending_cut = []
-            if self._drag_handle is not None:
-                self.canvas.delete(self._drag_handle)
-                self._drag_handle = None
+            self.canvas.delete("drag_handle")
+            self._drag_box = None
             self._remove_from_list(old)
             self._show_toast("Refreshed: no images left in this folder")
             return True
@@ -1361,120 +1515,75 @@ class BatchCrop(tk.Tk):
         on = self.drag_drop_var.get()
         if not on:
             self.canvas.delete("drag_handle")
-            self._drag_handle = None
+            self._drag_box = None
+            self._handle_press = False
             self.canvas.config(cursor="cross")
-        if on and self.image:
+        else:
             self._draw_drag_handle()
         self._show_toast("Drag file: " + ("ON" if on else "OFF"))
 
     def _draw_drag_handle(self):
+        """Fixed 'drag file' bar at bottom-centre of the viewport. Always visible, always on top."""
+        self.canvas.delete("drag_handle")
+        self._drag_box = None
         if not self.drag_drop_var.get() or not self.image or self.gallery_on:
             return
-        self.canvas.delete("drag_handle")
-        self._drag_handle = None
         cw = self.canvas.winfo_width() or 800
         ch = self.canvas.winfo_height() or 600
-        cx = cw // 2 + self.offset[0]
-        w = max(1, int(self.image.width * self.scale))
-        l = cx - w // 2
-        r = l + w
-        oy = self.offset[1]
-        img_bottom = oy + max(1, int(self.image.height * self.scale))
-        bar_h = max(18, min(28, int(24 * self.scale)))
-        y = img_bottom + 4
-        self._drag_handle = self.canvas.create_rectangle(
-            l, y, r, y + bar_h, fill="#2a6", outline="#1a1a1a", width=1, tags="drag_handle"
-        )
-        self.canvas.create_text(
-            cx, y + bar_h // 2, text="drag", fill="white", font=("TkDefaultFont", 9, "bold"),
-            tags="drag_handle"
-        )
-        self.canvas.tag_bind("drag_handle", "<ButtonPress-1>", self._on_drag_press)
-        self.canvas.tag_bind("drag_handle", "<B1-Motion>", self._on_drag_motion)
-        self.canvas.tag_bind("drag_handle", "<ButtonRelease-1>", self._on_drag_release)
+        bw, bh = 160, 28
+        x1 = max(0, (cw - bw) // 2)
+        y1 = max(0, ch - bh - 8)
+        x2, y2 = x1 + bw, y1 + bh
+        self._drag_box = (x1, y1, x2, y2)
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill="#2a6", outline="#1a1a1a",
+                                     width=1, tags="drag_handle")
+        self.canvas.create_text((x1 + x2) // 2, (y1 + y2) // 2, text="drag file", fill="white",
+                                font=("TkDefaultFont", 9, "bold"), tags="drag_handle")
+        self.canvas.tag_raise("drag_handle")
         self.canvas.tag_bind("drag_handle", "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
         self.canvas.tag_bind("drag_handle", "<Leave>", lambda e: self.canvas.config(cursor="cross"))
 
+    def _in_drag_box(self, x, y):
+        b = getattr(self, "_drag_box", None)
+        return bool(b and self.drag_drop_var.get() and not self.gallery_on
+                    and b[0] <= x <= b[2] and b[1] <= y <= b[3])
+
     def _on_drag_press(self, event):
-        if not self._drag_handle or not self.files or not self.folder:
+        if not self.files or not self.folder:
             return
         path = self._current_path()
         if path is None:
             return
         self._drag_path = path
         self._drag_start = (event.x, event.y)
-        return "break"
 
     def _on_drag_motion(self, event):
-        if not hasattr(self, "_drag_path") or self._drag_path is None:
+        path = getattr(self, "_drag_path", None)
+        if not path:
             return
         x, y = self._drag_start
         if abs(event.x - x) + abs(event.y - y) < 4:
             return
-        path = self._drag_path
+        self._drag_path = None
+        CRASH.crumb("start_drag_drop")
         if platform.system() == "Windows":
             if not self._windows_drag(path):
                 self._show_toast("Drag failed")
         else:
             if not self._linux_drag(path):
                 self._show_toast("Drag copied to clipboard; paste in your file manager")
-        self._drag_path = None
-        CRASH.crumb("start_drag_drop")
-        return "break"
 
     def _on_drag_release(self, event):
         self._drag_path = None
-        return "break"
 
     def _windows_drag(self, path):
         try:
-            import ctypes
-            from ctypes import wintypes
-            k32 = ctypes.windll.kernel32
-            u32 = ctypes.windll.user32
-            GMEM_MOVEABLE = 0x0002
-            CF_HDROP = 15
-
-            def make(data):
-                h = k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-                if not h:
-                    raise OSError("GlobalAlloc failed")
-                p = k32.GlobalLock(h)
-                if not p:
-                    k32.GlobalFree(h)
-                    raise OSError("GlobalLock failed")
-                ctypes.memmove(p, data, len(data))
-                k32.GlobalUnlock(h)
-                return h
-
-            p = os.path.normpath(os.path.abspath(path))
-            body = ("\0".join([p]) + "\0\0").encode("utf-16-le")
-            header = (20).to_bytes(4, "little") + bytes(8) + bytes(4) + (1).to_bytes(4, "little")
-            hdrop = make(header + body)
-            fmt = u32.RegisterClipboardFormatW("Preferred DropEffect")
-            effect = make((1).to_bytes(4, "little"))
-            for _ in range(10):
-                if u32.OpenClipboard(None):
-                    break
-                self.after(20)
-            else:
-                k32.GlobalFree(hdrop)
-                k32.GlobalFree(effect)
-                return False
-            try:
-                u32.EmptyClipboard()
-                r1 = u32.SetClipboardData(CF_HDROP, hdrop)
-                r2 = u32.SetClipboardData(fmt, effect)
-                if not r1 and not r2:
-                    k32.GlobalFree(hdrop)
-                    k32.GlobalFree(effect)
-                    return False
-            finally:
-                u32.CloseClipboard()
-            return True
+            hr = _win_file_drag(path) & 0xFFFFFFFF
         except Exception as e:
-            CRASH.crumb(f"windows_drag: {e}")
+            CRASH.crumb(f"ole_drag error: {type(e).__name__}")
             return False
+        CRASH.crumb(f"ole_drag hr=0x{hr:08x}")
+        return hr in (_OLE_S_OK, _DRAGDROP_S_DROP, _DRAGDROP_S_CANCEL)
 
     def _linux_drag(self, path):
         if not getattr(self, "_tkdnd_ok", False):
@@ -2208,14 +2317,10 @@ class BatchCrop(tk.Tk):
     def _on_press(self, event):
         if not self.image:
             return
-        # If click is on the drag handle, let the handle handler deal with it
-        if getattr(self, "_drag_handle", None) is not None and self.drag_drop_var.get():
-            try:
-                hx1, hy1, hx2, hy2 = self.canvas.bbox(self._drag_handle)
-                if hx1 is not None and hx1 <= event.x <= hx2 and hy1 <= event.y <= hy2:
-                    return
-            except Exception:
-                pass
+        self._handle_press = self._in_drag_box(event.x, event.y)
+        if self._handle_press:
+            self._on_drag_press(event)
+            return
         ix, iy = self._canvas_to_image(event.x, event.y)
         prev_ratio = 1.0
         self._push_crop_hist()
@@ -2237,6 +2342,9 @@ class BatchCrop(tk.Tk):
         self.canvas.delete("crop")
 
     def _on_drag(self, event):
+        if getattr(self, "_handle_press", False):
+            self._on_drag_motion(event)
+            return
         if not self.drag:
             return
         ix, iy = self._canvas_to_image(event.x, event.y)
@@ -2304,6 +2412,9 @@ class BatchCrop(tk.Tk):
 
     def _on_motion(self, event):
         if self.drag or not self.image:
+            return
+        if self._in_drag_box(event.x, event.y):
+            self.canvas.config(cursor="hand2")
             return
         handle = self._hit_handle(event.x, event.y)
         if handle:
@@ -2379,6 +2490,10 @@ class BatchCrop(tk.Tk):
         self.crop = (l, u, r, d)
 
     def _on_release(self, event):
+        if getattr(self, "_handle_press", False):
+            self._handle_press = False
+            self._drag_path = None
+            return
         # a click that changed nothing should not leave a no-op undo step
         if self.drag and self.crop_hist and self.crop_hist[-1] == (tuple(self.crop) if self.crop else None):
             self.crop_hist.pop()
