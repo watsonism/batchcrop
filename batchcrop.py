@@ -1376,7 +1376,7 @@ class BatchCrop(tk.Tk):
         ch = self.canvas.winfo_height() or 600
         cx = cw // 2 + self.offset[0]
         w = max(1, int(self.image.width * self.scale))
-        l = cx - w // 2 + self.offset[0]
+        l = cx - w // 2
         r = l + w
         oy = self.offset[1]
         img_bottom = oy + max(1, int(self.image.height * self.scale))
@@ -1403,6 +1403,7 @@ class BatchCrop(tk.Tk):
             return
         self._drag_path = path
         self._drag_start = (event.x, event.y)
+        return "break"
 
     def _on_drag_motion(self, event):
         if not hasattr(self, "_drag_path") or self._drag_path is None:
@@ -1419,9 +1420,11 @@ class BatchCrop(tk.Tk):
                 self._show_toast("Drag copied to clipboard; paste in your file manager")
         self._drag_path = None
         CRASH.crumb("start_drag_drop")
+        return "break"
 
     def _on_drag_release(self, event):
         self._drag_path = None
+        return "break"
 
     def _windows_drag(self, path):
         try:
