@@ -40,7 +40,7 @@ _APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else
 CRASH_DIR_NAME = "crash-reports"
 CRUMB_METHODS = (
     "open_folder", "refresh_folder", "toggle_gallery", "apply_sort", "load_image", "next", "prev",
-    "save_crop", "delete_current", "_do_delete_many", "undo", "cut_current", "copy_current",
+    "save_crop", "delete_current", "_do_delete_many", "undo", "cut_current", "copy_current", "start_drag_drop",
     "rename_current", "batch_rename", "move_to_folder", "copy_to_folder", "select_all",
     "zoom_by", "zoom_reset", "open_in_explorer", "_do_rename_many", "_transfer",
 )
@@ -196,6 +196,7 @@ class CrashReporter:
         g("selected", lambda: len(a.selection))
         g("sort", lambda: a.sort_var.get())
         g("keep crop", lambda: a.keep_crop_var.get())
+        g("drag drop", lambda: a.drag_drop_var.get())
         g("zoom", lambda: round(a.zoom, 3))
         g("image size", lambda: f"{a.image.width}x{a.image.height}" if a.image else "none")
         g("crop box set", lambda: bool(a.crop))
@@ -376,6 +377,8 @@ class BatchCrop(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.gallery_on = False
         self.keep_crop_var = tk.BooleanVar(value=False)
+        self.drag_drop_var = tk.BooleanVar(value=False)
+        self._drag_handle = None
         self.last_crop = None
         self.drag_ratio = 1.0
         self.thumb_cache = {}
@@ -520,13 +523,16 @@ class BatchCrop(tk.Tk):
         tk.Checkbutton(bottom, text="Keep crop (K)", variable=self.keep_crop_var, command=self._on_keep_toggle,
                        bg="#2d2d2d", fg="white", selectcolor="#1e1e1e", activebackground="#2d2d2d",
                        activeforeground="white").pack(side=tk.LEFT, padx=4, pady=4)
+        tk.Checkbutton(bottom, text="Drag file", variable=self.drag_drop_var, command=self._on_drag_drop_toggle,
+                       bg="#2d2d2d", fg="white", selectcolor="#1e1e1e", activebackground="#2d2d2d",
+                       activeforeground="white").pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(bottom, text="Next", command=self.next, bg="#3a3a3a", fg="white").pack(
             side=tk.LEFT, padx=4, pady=4
         )
 
         help_lbl = tk.Label(
             bottom,
-            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Drag edges/corners: resize   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   F5: refresh   F6/F7: move/copy to   Ctrl+Z: undo   Ctrl+X: cut   Ctrl+C: copy",
+            text="Left: prev   Right: next   Enter: save crop   Del: delete   Esc: clear crop   Wheel: files   G: gallery   K: keep crop   Drag edges/corners: resize   Shift+drag: lock ratio   Ctrl+/-: zoom   F2: rename   F5: refresh   F6/F7: move/copy to   Ctrl+Z: undo   Ctrl+X: cut   Ctrl+C: copy   Drag file: toggle handle",
             bg="#2d2d2d",
             fg="#888888",
         )
@@ -829,6 +835,9 @@ class BatchCrop(tk.Tk):
             del self.thumb_cache[k]
         if not listing:
             self.pending_cut = []
+            if self._drag_handle is not None:
+                self.canvas.delete(self._drag_handle)
+                self._drag_handle = None
             self._remove_from_list(old)
             self._show_toast("Refreshed: no images left in this folder")
             return True
@@ -1347,6 +1356,129 @@ class BatchCrop(tk.Tk):
     # ------------------------------------------------------------------
     # Sorting
     # ------------------------------------------------------------------
+
+    def _on_drag_drop_toggle(self):
+        on = self.drag_drop_var.get()
+        if not on and self._drag_handle is not None:
+            self.canvas.delete(self._drag_handle)
+            self._drag_handle = None
+            self.canvas.config(cursor="cross")
+        if on and self.image:
+            self._draw_drag_handle()
+        self._show_toast("Drag file: " + ("ON" if on else "OFF"))
+
+    def _draw_drag_handle(self):
+        if not self.drag_drop_var.get() or not self.image or self.gallery_on:
+            return
+        if self._drag_handle is not None:
+            self.canvas.delete(self._drag_handle)
+        cw = self.canvas.winfo_width() or 800
+        ch = self.canvas.winfo_height() or 600
+        cx = cw // 2 + self.offset[0]
+        w = max(1, int(self.image.width * self.scale))
+        l = cx - w // 2 + self.offset[0]
+        r = l + w
+        oy = self.offset[1]
+        img_bottom = oy + max(1, int(self.image.height * self.scale))
+        bar_h = max(18, min(28, int(24 * self.scale)))
+        y = img_bottom + 4
+        self._drag_handle = self.canvas.create_rectangle(
+            l, y, r, y + bar_h, fill="#2a6", outline="#1a1a1a", width=1, tags="drag_handle"
+        )
+        self.canvas.create_text(
+            cx, y + bar_h // 2, text="drag", fill="white", font=("TkDefaultFont", 9, "bold"),
+            tags="drag_handle"
+        )
+        self.canvas.tag_bind(self._drag_handle, "<ButtonPress-1>", self._on_drag_press)
+        self.canvas.tag_bind(self._drag_handle, "<B1-Motion>", self._on_drag_motion)
+        self.canvas.tag_bind(self._drag_handle, "<ButtonRelease-1>", self._on_drag_release)
+        self.canvas.tag_bind(self._drag_handle, "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
+        self.canvas.tag_bind(self._drag_handle, "<Leave>", lambda e: self.canvas.config(cursor="cross"))
+
+    def _on_drag_press(self, event):
+        if not self._drag_handle or not self.files or not self.folder:
+            return
+        path = self._current_path()
+        if path is None:
+            return
+        self._drag_path = path
+        self._drag_start = (event.x, event.y)
+
+    def _on_drag_motion(self, event):
+        if not hasattr(self, "_drag_path") or self._drag_path is None:
+            return
+        x, y = self._drag_start
+        if abs(event.x - x) + abs(event.y - y) < 4:
+            return
+        path = self._drag_path
+        if platform.system() == "Windows":
+            if not self._windows_drag(path):
+                self._show_toast("Drag failed")
+        else:
+            if not self._linux_drag(path):
+                self._show_toast("Drag copied to clipboard; paste in your file manager")
+        self._drag_path = None
+        CRASH.crumb("start_drag_drop")
+
+    def _on_drag_release(self, event):
+        self._drag_path = None
+
+    def _windows_drag(self, path):
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            u32 = ctypes.windll.user32
+            GMEM_MOVEABLE = 0x0002
+            CF_HDROP = 15
+
+            def make(data):
+                h = k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                p = k32.GlobalLock(h)
+                ctypes.memmove(p, data, len(data))
+                k32.GlobalUnlock(h)
+                return h
+
+            p = os.path.normpath(os.path.abspath(path))
+            body = ("\0".join([p]) + "\0\0").encode("utf-16-le")
+            header = (20).to_bytes(4, "little") + bytes(8) + bytes(4) + (1).to_bytes(4, "little")
+            hdrop = make(header + body)
+            fmt = u32.RegisterClipboardFormatW("Preferred DropEffect")
+            effect = make((1).to_bytes(4, "little"))
+            for _ in range(10):
+                if u32.OpenClipboard(None):
+                    break
+                self.after(20)
+            else:
+                return False
+            try:
+                u32.EmptyClipboard()
+                u32.SetClipboardData(CF_HDROP, hdrop)
+                u32.SetClipboardData(fmt, effect)
+            finally:
+                u32.CloseClipboard()
+            return True
+        except Exception:
+            return False
+
+    def _linux_drag(self, path):
+        if not getattr(self, "_tkdnd_ok", False):
+            try:
+                self.tk.call("package", "require", "tkdnd")
+                self._tkdnd_ok = True
+            except Exception:
+                self._tkdnd_ok = False
+        if self._tkdnd_ok:
+            try:
+                self.tk.call("tkdnd", "drop", "register", self.canvas._w, "FILE")
+                self.tk.call("tkdnd", "drag", "start", self.canvas._w, path, "")
+                return True
+            except Exception:
+                self._tkdnd_ok = False
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        return False
+
     def _sort_files(self, keep=None):
         """Sort self.files per the selected mode, keeping the selected file."""
         if keep is None and self.files and 0 <= self.index < len(self.files):
