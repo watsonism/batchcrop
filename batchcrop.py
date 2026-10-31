@@ -1359,8 +1359,8 @@ class BatchCrop(tk.Tk):
 
     def _on_drag_drop_toggle(self):
         on = self.drag_drop_var.get()
-        if not on and self._drag_handle is not None:
-            self.canvas.delete(self._drag_handle)
+        if not on:
+            self.canvas.delete("drag_handle")
             self._drag_handle = None
             self.canvas.config(cursor="cross")
         if on and self.image:
@@ -1370,8 +1370,8 @@ class BatchCrop(tk.Tk):
     def _draw_drag_handle(self):
         if not self.drag_drop_var.get() or not self.image or self.gallery_on:
             return
-        if self._drag_handle is not None:
-            self.canvas.delete(self._drag_handle)
+        self.canvas.delete("drag_handle")
+        self._drag_handle = None
         cw = self.canvas.winfo_width() or 800
         ch = self.canvas.winfo_height() or 600
         cx = cw // 2 + self.offset[0]
@@ -1389,11 +1389,11 @@ class BatchCrop(tk.Tk):
             cx, y + bar_h // 2, text="drag", fill="white", font=("TkDefaultFont", 9, "bold"),
             tags="drag_handle"
         )
-        self.canvas.tag_bind(self._drag_handle, "<ButtonPress-1>", self._on_drag_press)
-        self.canvas.tag_bind(self._drag_handle, "<B1-Motion>", self._on_drag_motion)
-        self.canvas.tag_bind(self._drag_handle, "<ButtonRelease-1>", self._on_drag_release)
-        self.canvas.tag_bind(self._drag_handle, "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
-        self.canvas.tag_bind(self._drag_handle, "<Leave>", lambda e: self.canvas.config(cursor="cross"))
+        self.canvas.tag_bind("drag_handle", "<ButtonPress-1>", self._on_drag_press)
+        self.canvas.tag_bind("drag_handle", "<B1-Motion>", self._on_drag_motion)
+        self.canvas.tag_bind("drag_handle", "<ButtonRelease-1>", self._on_drag_release)
+        self.canvas.tag_bind("drag_handle", "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
+        self.canvas.tag_bind("drag_handle", "<Leave>", lambda e: self.canvas.config(cursor="cross"))
 
     def _on_drag_press(self, event):
         if not self._drag_handle or not self.files or not self.folder:
@@ -1895,6 +1895,8 @@ class BatchCrop(tk.Tk):
         self.path_label.config(text=os.path.normpath(path))
         self._update_crop_size_label()
         self._gal_redraw()
+        if self.drag_drop_var.get():
+            self._draw_drag_handle()
 
     def _clear_crop(self):
         if self.crop:
@@ -2067,6 +2069,8 @@ class BatchCrop(tk.Tk):
         if self.crop:
             self._draw_crop()
         self.zoom_label.config(text=f"{round(self.zoom * 100)}%" if self.zoom != 1.0 else "")
+        if getattr(self, "drag_drop_var", None) and self.drag_drop_var.get() and self.image and not self.gallery_on:
+            self._draw_drag_handle()
 
     # ------------------------------------------------------------------
     # Zoom / pan / wheel
