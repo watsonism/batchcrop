@@ -1437,7 +1437,12 @@ class BatchCrop(tk.Tk):
 
             def make(data):
                 h = k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                if not h:
+                    raise OSError("GlobalAlloc failed")
                 p = k32.GlobalLock(h)
+                if not p:
+                    k32.GlobalFree(h)
+                    raise OSError("GlobalLock failed")
                 ctypes.memmove(p, data, len(data))
                 k32.GlobalUnlock(h)
                 return h
@@ -1453,15 +1458,22 @@ class BatchCrop(tk.Tk):
                     break
                 self.after(20)
             else:
+                k32.GlobalFree(hdrop)
+                k32.GlobalFree(effect)
                 return False
             try:
                 u32.EmptyClipboard()
-                u32.SetClipboardData(CF_HDROP, hdrop)
-                u32.SetClipboardData(fmt, effect)
+                r1 = u32.SetClipboardData(CF_HDROP, hdrop)
+                r2 = u32.SetClipboardData(fmt, effect)
+                if not r1 and not r2:
+                    k32.GlobalFree(hdrop)
+                    k32.GlobalFree(effect)
+                    return False
             finally:
                 u32.CloseClipboard()
             return True
-        except Exception:
+        except Exception as e:
+            CRASH.crumb(f"windows_drag: {e}")
             return False
 
     def _linux_drag(self, path):
@@ -2196,6 +2208,14 @@ class BatchCrop(tk.Tk):
     def _on_press(self, event):
         if not self.image:
             return
+        # If click is on the drag handle, let the handle handler deal with it
+        if getattr(self, "_drag_handle", None) is not None and self.drag_drop_var.get():
+            try:
+                hx1, hy1, hx2, hy2 = self.canvas.bbox(self._drag_handle)
+                if hx1 is not None and hx1 <= event.x <= hx2 and hy1 <= event.y <= hy2:
+                    return
+            except Exception:
+                pass
         ix, iy = self._canvas_to_image(event.x, event.y)
         prev_ratio = 1.0
         self._push_crop_hist()
